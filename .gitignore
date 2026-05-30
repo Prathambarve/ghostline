@@ -1,0 +1,16 @@
+# binary
+ghostline
+
+# macOS
+.DS_Store
+
+# editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Go test cache / coverage
+*.test
+*.out
+coverage.html
