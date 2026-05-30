@@ -8,16 +8,40 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/prathamesh/ghostline/internal/completion"
 	"github.com/prathamesh/ghostline/internal/config"
 	ctxdetect "github.com/prathamesh/ghostline/internal/context"
+	"github.com/prathamesh/ghostline/internal/fixcache"
+	"github.com/prathamesh/ghostline/internal/history"
 	"github.com/prathamesh/ghostline/internal/llm"
 	"github.com/prathamesh/ghostline/internal/recovery"
 	"github.com/prathamesh/ghostline/internal/session"
+	"github.com/prathamesh/ghostline/internal/workflow"
 )
+
+// maxHistoryLines bounds the persisted command log.
+const maxHistoryLines = 5000
+
+// maxFixCacheLines bounds the persisted error→fix recovery cache.
+const maxFixCacheLines = 2000
+
+// offerTTL bounds how long a pending recovery offer waits to be accepted. The
+// shell pre-fills the fix into the very next prompt, so acceptance is normally
+// immediate; this just keeps a stale, ignored offer from being learned much
+// later if the user happens to type the same command.
+const offerTTL = 5 * time.Minute
+
+// frequentSuggestions is how many cross-session commands we surface to the model.
+const frequentSuggestions = 10
+
+// transitionSuggestions is how many predicted next-commands (from the command-
+// transition model) we surface to the model.
+const transitionSuggestions = 5
 
 type Request struct {
 	Type      string `json:"type"`
@@ -30,30 +54,70 @@ type Request struct {
 }
 
 type Response struct {
-	Suggestion string `json:"suggestion,omitempty"`
-	Fix        string `json:"fix,omitempty"`
-	Why        string `json:"why,omitempty"`
-	Type       string `json:"type"`
-	Status     string `json:"status,omitempty"`
-	Model      string `json:"model,omitempty"`
-	Sessions   int    `json:"sessions,omitempty"`
-	Error      string `json:"error,omitempty"`
+	Suggestion string                 `json:"suggestion,omitempty"`
+	Fix        string                 `json:"fix,omitempty"`
+	Why        string                 `json:"why,omitempty"`
+	Type       string                 `json:"type"`
+	Status     string                 `json:"status,omitempty"`
+	Model      string                 `json:"model,omitempty"`
+	Sessions   int                    `json:"sessions,omitempty"`
+	Error      string                 `json:"error,omitempty"`
+	Candidates []completion.Candidate `json:"candidates,omitempty"`
+}
+
+// offer is a recovery suggestion awaiting the user's verdict. We hold the key
+// the fix was produced for so that when the user runs the fix and it succeeds,
+// we can learn (key → fix) into the cache.
+type offer struct {
+	cmd    string
+	stderr string
+	repo   string
+	fix    string
+	why    string
+	at     time.Time
 }
 
 type Server struct {
 	cfg       *config.Config
 	store     *session.Store
+	history   *history.Store
+	fixcache  *fixcache.Store
+	workflows *workflow.Store
 	completer *completion.Completer
 	recoverer *recovery.Recovery
+
+	offersMu sync.Mutex
+	offers   map[string]offer // sessionID → last LLM fix awaiting acceptance
 }
 
 func NewServer(cfg *config.Config) *Server {
 	gen := llm.New(cfg)
+	var hist *history.Store
+	var fcache *fixcache.Store
+	if cfg.HistoryEnabled {
+		if path, err := config.HistoryPath(); err == nil {
+			hist = history.NewStore(path, maxHistoryLines)
+		}
+		if path, err := config.FixCachePath(); err == nil {
+			fcache = fixcache.NewStore(path, maxFixCacheLines)
+		}
+	}
+	// Workflows are user-authored saved commands, not learned data, so they are
+	// available regardless of the history privacy setting.
+	var wf *workflow.Store
+	if path, err := config.WorkflowsPath(); err == nil {
+		wf = workflow.NewStore(path)
+	}
+
 	return &Server{
 		cfg:       cfg,
 		store:     session.NewStore(cfg.MaxContextCommands),
+		history:   hist,
+		fixcache:  fcache,
+		workflows: wf,
 		completer: completion.New(gen, cfg.CompletionTimeoutMS),
 		recoverer: recovery.New(gen, cfg.RecoveryTimeoutMS),
+		offers:    make(map[string]offer),
 	}
 }
 
@@ -109,6 +173,10 @@ func (s *Server) handleConn(conn net.Conn) {
 	switch req.Type {
 	case "complete":
 		resp = s.handleComplete(req)
+	case "complete_menu":
+		resp = s.handleCompleteMenu(req)
+	case "palette":
+		resp = s.handlePalette(req)
 	case "recover":
 		resp = s.handleRecover(req)
 	case "update_context":
@@ -129,62 +197,259 @@ func (s *Server) handleConn(conn net.Conn) {
 
 // activeModel reports the model backing the currently selected backend.
 func (s *Server) activeModel() string {
-	if s.cfg.Backend == "ollama" {
-		return s.cfg.Model
+	switch s.cfg.Backend {
+	case "openai":
+		return s.cfg.OpenAIModel
+	case "groq":
+		return s.cfg.GroqModel
+	default:
+		return s.cfg.AnthropicModel
 	}
-	return s.cfg.AnthropicModel
+}
+
+// completionContext assembles the session context plus cross-session signals
+// (frequently-used and likely-next commands) shared by the single-suggestion and
+// menu completion paths.
+func (s *Server) completionContext(req Request) (session.Context, []string, []string) {
+	ctx := *s.store.Get(req.SessionID)
+	if s.cfg.SendCWD && req.CWD != "" && ctx.CWD == "" {
+		ctx.CWD = req.CWD
+	}
+	if !s.cfg.SendRecentCommands {
+		ctx.RecentCommands = nil
+	}
+
+	var frequent, successors []string
+	if s.history != nil {
+		frequent = s.history.Frequent(ctx.GitRepo, ctx.CWD, ctx.ProjectType, frequentSuggestions)
+		if n := len(ctx.RecentCommands); n > 0 {
+			prev := ctx.RecentCommands[n-1].Command
+			successors = s.history.Successors(prev, ctx.GitRepo, ctx.CWD, transitionSuggestions)
+		}
+	}
+	return ctx, frequent, successors
 }
 
 func (s *Server) handleComplete(req Request) Response {
-	ctx := s.store.Get(req.SessionID)
-	if req.CWD != "" && ctx.CWD == "" {
-		ctx.CWD = req.CWD
-	}
+	ctx, frequent, successors := s.completionContext(req)
 
-	suggestion, err := s.completer.Complete(req.Buffer, ctx)
-	if err != nil {
-		return Response{Type: "none"}
-	}
-	if suggestion == "" {
+	suggestion, err := s.completer.Complete(req.Buffer, &ctx, frequent, successors)
+	if err != nil || suggestion == "" {
 		return Response{Type: "none"}
 	}
 	return Response{Type: "completion", Suggestion: suggestion}
 }
 
-func (s *Server) handleRecover(req Request) Response {
-	ctx := s.store.Get(req.SessionID)
+// handleCompleteMenu returns several described candidate completions — the data
+// behind the Fig-style picker.
+func (s *Server) handleCompleteMenu(req Request) Response {
+	ctx, frequent, successors := s.completionContext(req)
 
-	result, err := s.recoverer.Recover(req.Command, req.ExitCode, req.Stderr, ctx)
+	cands, err := s.completer.CompleteMenu(req.Buffer, &ctx, frequent, successors)
+	if err != nil || len(cands) == 0 {
+		return Response{Type: "none"}
+	}
+	return Response{Type: "menu", Candidates: cands}
+}
+
+// handlePalette returns the command palette's contents: saved workflows first,
+// then frequently-used commands and likely next commands for this context. All
+// de-duplicated by command, workflows winning ties.
+func (s *Server) handlePalette(req Request) Response {
+	_, frequent, successors := s.completionContext(req)
+
+	var cands []completion.Candidate
+	if s.workflows != nil {
+		for _, w := range s.workflows.List() {
+			cands = append(cands, completion.Candidate{
+				Command:     w.Command,
+				Description: w.Description,
+				Source:      "workflow",
+			})
+		}
+	}
+	for _, c := range frequent {
+		cands = append(cands, completion.Candidate{Command: c, Source: "frequent"})
+	}
+	for _, c := range successors {
+		cands = append(cands, completion.Candidate{Command: c, Source: "next"})
+	}
+
+	cands = dedupeCandidates(cands)
+	if len(cands) == 0 {
+		return Response{Type: "none"}
+	}
+	return Response{Type: "palette", Candidates: cands}
+}
+
+// dedupeCandidates keeps the first occurrence of each command, preserving order
+// (so a workflow shadows the same command surfaced from history).
+func dedupeCandidates(in []completion.Candidate) []completion.Candidate {
+	seen := make(map[string]bool, len(in))
+	out := in[:0]
+	for _, c := range in {
+		if c.Command == "" || seen[c.Command] {
+			continue
+		}
+		seen[c.Command] = true
+		out = append(out, c)
+	}
+	return out
+}
+
+func (s *Server) handleRecover(req Request) Response {
+	ctx := *s.store.Get(req.SessionID)
+	stderr := req.Stderr
+	if !s.cfg.SendStderr {
+		stderr = ""
+	}
+	if !s.cfg.SendRecentCommands {
+		ctx.RecentCommands = nil
+	}
+
+	// Tier 0: replay a fix the user previously accepted for this exact failure —
+	// instant, offline, no API round-trip. This is the payoff of learning.
+	if s.fixcache != nil {
+		if e := s.fixcache.Lookup(req.Command, stderr, ctx.GitRepo); e != nil {
+			return recoveryResponse(e.Fix, e.Why)
+		}
+	}
+
+	result, err := s.recoverer.Recover(req.Command, req.ExitCode, stderr, &ctx)
 	if err != nil || result == nil {
 		return Response{Type: "none"}
 	}
 
-	display := result.Fix
-	if result.Why != "" {
-		display = result.Fix + " — " + result.Why
+	// Remember the offer so we can learn it if the user accepts it (runs the fix
+	// and it succeeds — detected in handleUpdateContext). Only LLM-tier fixes are
+	// worth caching; deterministic typo fixes are already instant and offline.
+	if s.fixcache != nil && result.Source == "llm" {
+		s.offersMu.Lock()
+		s.offers[req.SessionID] = offer{
+			cmd:    req.Command,
+			stderr: stderr,
+			repo:   ctx.GitRepo,
+			fix:    result.Fix,
+			why:    result.Why,
+			at:     time.Now(),
+		}
+		s.offersMu.Unlock()
 	}
-	return Response{Type: "recovery", Fix: result.Fix, Why: result.Why, Suggestion: display}
+
+	return recoveryResponse(result.Fix, result.Why)
+}
+
+// recoveryResponse builds the wire response for a fix, including the combined
+// display string the shell prints.
+func recoveryResponse(fix, why string) Response {
+	display := fix
+	if why != "" {
+		display = fix + " — " + why
+	}
+	return Response{Type: "recovery", Fix: fix, Why: why, Suggestion: display}
+}
+
+// learnIfAccepted checks whether the just-run command was the fix we offered
+// this session and, if it succeeded, records it in the recovery cache. A
+// non-matching command leaves the offer in place: the failed command's own
+// async context-update can race ahead of the user's acceptance, and we must not
+// drop the offer before the fix actually runs. The offer is consumed once the
+// fix runs (pass or fail), overwritten by the next recovery, or expired by TTL.
+func (s *Server) learnIfAccepted(sessionID, command string, exitCode int) {
+	if s.fixcache == nil {
+		return
+	}
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return
+	}
+
+	s.offersMu.Lock()
+	o, ok := s.offers[sessionID]
+	if !ok {
+		s.offersMu.Unlock()
+		return
+	}
+	if command != strings.TrimSpace(o.fix) {
+		// Not the fix (could be the original failure's own update, or an
+		// unrelated command). Leave the offer pending unless it has gone stale.
+		if time.Since(o.at) > offerTTL {
+			delete(s.offers, sessionID)
+		}
+		s.offersMu.Unlock()
+		return
+	}
+	// The fix ran: resolve the offer regardless of outcome.
+	delete(s.offers, sessionID)
+	s.offersMu.Unlock()
+
+	if exitCode != 0 || time.Since(o.at) > offerTTL {
+		return // ran but failed, or accepted too late — don't cache a bad fix
+	}
+	s.fixcache.Learn(o.cmd, o.stderr, o.repo, o.fix, o.why) //nolint:errcheck
 }
 
 func (s *Server) handleUpdateContext(req Request) Response {
 	var gitBranch, gitRepo, projectType string
+	var gitStatus, dirFiles []string
 	if req.CWD != "" {
 		git := ctxdetect.DetectGit(req.CWD)
 		gitBranch = git.Branch
-		gitRepo = git.Repo
 		projectType = ctxdetect.DetectProject(req.CWD)
+		if s.cfg.SendGitRemote {
+			gitRepo = git.Repo
+		}
+		if s.cfg.SendGitStatus {
+			gitStatus = ctxdetect.DetectGitStatus(req.CWD)
+		}
+		if s.cfg.SendDirFiles {
+			dirFiles = ctxdetect.DetectDirFiles(req.CWD)
+		}
+	}
+
+	cwd := req.CWD
+	if !s.cfg.SendCWD {
+		cwd = ""
+	}
+	command := req.Command
+	stderr := req.Stderr
+	if !s.cfg.SendRecentCommands {
+		command = ""
+	}
+	if !s.cfg.SendStderr {
+		stderr = ""
 	}
 
 	s.store.Apply(session.Update{
 		SessionID:   req.SessionID,
-		CWD:         req.CWD,
-		Command:     req.Command,
+		CWD:         cwd,
+		Command:     command,
 		ExitCode:    req.ExitCode,
-		Stderr:      req.Stderr,
+		Stderr:      stderr,
 		GitBranch:   gitBranch,
 		GitRepo:     gitRepo,
+		GitStatus:   gitStatus,
 		ProjectType: projectType,
+		DirFiles:    dirFiles,
 	})
+
+	// If this command was the recovery fix we offered, and it worked, learn it
+	// so an identical future failure replays instantly. Uses the raw command
+	// (not the privacy-gated one) since acceptance is matched against the fix we
+	// actually suggested.
+	s.learnIfAccepted(req.SessionID, req.Command, req.ExitCode)
+
+	// Persist a redacted record for cross-session recall (best-effort; secrets
+	// are dropped/masked inside history.Append).
+	if s.history != nil && req.Command != "" {
+		s.history.Append(history.Record{ //nolint:errcheck
+			Command:     req.Command,
+			ExitCode:    req.ExitCode,
+			CWD:         cwd,
+			GitRepo:     gitRepo,
+			ProjectType: projectType,
+		})
+	}
 
 	return Response{Type: "ok"}
 }
@@ -220,6 +485,14 @@ func SendRequest(req Request) (*Response, error) {
 
 // EnsureDaemon starts the daemon in the background if not already running.
 func EnsureDaemon() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if !cfg.SetupComplete {
+		return fmt.Errorf("run `ghostline setup` first")
+	}
+
 	sockPath, err := config.SocketPath()
 	if err != nil {
 		return err
@@ -251,6 +524,26 @@ func EnsureDaemon() error {
 	}
 
 	return fmt.Errorf("daemon did not start within 3s")
+}
+
+// Stop terminates a running daemon (via its PID file) and removes the socket so
+// the next call starts a fresh one. No-op if nothing is running.
+func Stop() error {
+	pidPath, err := config.PIDPath()
+	if err != nil {
+		return err
+	}
+	if data, err := os.ReadFile(pidPath); err == nil {
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
+			if proc, err := os.FindProcess(pid); err == nil {
+				proc.Signal(syscall.SIGTERM)
+			}
+		}
+	}
+	if sock, _ := config.SocketPath(); sock != "" {
+		os.Remove(sock)
+	}
+	return nil
 }
 
 // StartBackground re-execs self as a detached background daemon.

@@ -44,6 +44,119 @@ bindkey '^@' _ghostline_complete       # Ctrl+Space
 bindkey '^ ' _ghostline_complete       # Ctrl+Space (alternate spelling)
 bindkey '^X^G' _ghostline_complete     # Ctrl+X Ctrl+G — terminal-independent fallback
 
+# ── Picker: shared chooser for the completion menu and command palette ────────
+# Reads TSV (`command<TAB>label`) on stdin, shows the labels, and echoes the
+# chosen command (field 1) on stdout. Uses fzf when available; otherwise a small
+# numbered menu. Interactive I/O goes to /dev/tty so it works inside a ZLE widget
+# (whose stdin is the piped TSV, not the keyboard).
+
+_ghostline_pick() {
+    local input
+    input="$(cat)"
+    [[ -z "$input" ]] && return 1
+
+    if command -v fzf &>/dev/null; then
+        print -r -- "$input" \
+            | fzf --delimiter='\t' --with-nth=2 --height=40% --reverse --no-multi </dev/tty \
+            | cut -f1
+        return
+    fi
+
+    # Fallback: numbered menu on the tty.
+    local -a cmds labels
+    local cmd label
+    while IFS=$'\t' read -r cmd label; do
+        [[ -z "$cmd" ]] && continue
+        cmds+=("$cmd")
+        labels+=("$label")
+    done <<< "$input"
+    (( ${#cmds} == 0 )) && return 1
+
+    local i
+    for (( i = 1; i <= ${#labels}; i++ )); do
+        print -r -- "  $i) ${labels[i]}" >/dev/tty
+    done
+    print -n "select [1-${#cmds}]: " >/dev/tty
+    local choice
+    read -r choice </dev/tty
+    [[ "$choice" == <-> ]] && (( choice >= 1 && choice <= ${#cmds} )) && print -r -- "${cmds[choice]}"
+}
+
+# Run a TSV-producing ghostline subcommand through the picker and load the chosen
+# command into the buffer. Shared by the two widgets below.
+_ghostline_pick_into_buffer() {
+    local sel
+    sel="$("$@" 2>/dev/null | _ghostline_pick)"
+    if [[ -n "$sel" ]]; then
+        BUFFER="$sel"
+        CURSOR=${#BUFFER}
+    fi
+    zle reset-prompt
+}
+
+# Ctrl+X Ctrl+N — described completion menu (Fig-style): pick from several
+# candidate completions of the current buffer, each with a short description.
+_ghostline_completion_menu() {
+    [[ -z "$BUFFER" ]] && return
+    _ghostline_pick_into_buffer ghostline complete-menu --buffer "$BUFFER" --session "$GHOSTLINE_SESSION"
+}
+zle -N _ghostline_completion_menu
+bindkey '^X^N' _ghostline_completion_menu
+
+# Ctrl+X Ctrl+P — command palette: pick a saved workflow or a frequent/next
+# command for this directory/repo. Works on an empty buffer.
+_ghostline_palette() {
+    _ghostline_pick_into_buffer ghostline palette --session "$GHOSTLINE_SESSION"
+}
+zle -N _ghostline_palette
+bindkey '^X^P' _ghostline_palette
+
+# ── ZLE: secret guard (warn before running a command that leaks a key) ────────
+# We override accept-line so that pressing Enter on a command containing secret
+# material (an API key, token, password literal, Authorization header…) does NOT
+# run it immediately. Instead we print a warning and re-arm: a SECOND Enter on
+# the unchanged line runs it, while editing the line re-checks. This closes the
+# hole where a pasted key (e.g. gsk_…) lands in shell history or a commit before
+# anyone notices.
+#
+# The expensive authoritative check (the ghostline binary) only runs when a cheap
+# local pre-filter sees a plausibly-risky token, so ordinary commands pay nothing.
+
+typeset -g _GHOSTLINE_GUARD_ARMED=""
+
+_ghostline_guard_suspect() {
+    # Cheap, broad pre-filter. High recall, low precision on purpose: anything it
+    # lets through is confirmed by the binary; anything it rejects is definitely
+    # not a secret literal we care about. Lowercased for case-insensitive checks,
+    # with a couple of case-sensitive provider prefixes (AKIA/AIza) added.
+    local b="${1:l}"
+    case "$b" in
+        *key=*|*token=*|*secret=*|*password=*|*passwd=*|*credential=*) return 0 ;;
+        *authorization:*|*bearer\ *) return 0 ;;
+        *sk-*|*gsk_*|*ghp_*|*gho_*|*ghu_*|*ghs_*|*ghr_*|*glpat-*|*xox*|*npm_*) return 0 ;;
+        *-----begin*private\ key*) return 0 ;;
+    esac
+    case "$1" in
+        *AKIA*|*AIza*) return 0 ;;
+    esac
+    return 1
+}
+
+_ghostline_accept_line() {
+    if [[ -n "$BUFFER" && "$BUFFER" != "$_GHOSTLINE_GUARD_ARMED" ]] && _ghostline_guard_suspect "$BUFFER"; then
+        local reason
+        reason="$(ghostline guard --buffer "$BUFFER" 2>/dev/null)"
+        if [[ -n "$reason" ]]; then
+            _GHOSTLINE_GUARD_ARMED="$BUFFER"
+            zle -M "⚠ ghostline: this command $reason — press Enter again to run, or edit the line"
+            return 0   # swallow this Enter; keep the buffer for review
+        fi
+    fi
+    _GHOSTLINE_GUARD_ARMED=""
+    zle .accept-line
+}
+zle -N accept-line _ghostline_accept_line
+
 # ── preexec: runs before each command ────────────────────────────────────────
 
 _ghostline_preexec() {
@@ -66,7 +179,6 @@ _ghostline_precmd() {
     _GHOSTLINE_LAST_CMD=""
 
     [[ -z "$last_cmd" ]] && return
-    [[ "$last_cmd" == ghostline\ * || "$last_cmd" == "ghostline" ]] && return
 
     ghostline context update \
         --session "$GHOSTLINE_SESSION" \
@@ -74,7 +186,31 @@ _ghostline_precmd() {
         --exit-code "$exit_code" \
         --cwd "$PWD" &>/dev/null &!
 
-    if (( exit_code != 0 )); then
+    # Don't run recovery on ghostline's own commands — but DO record them above
+    # so the model learns valid subcommands/args (e.g. "ghostline backend anthropic"
+    # ends up in history and future completions of "ghostline backend an" work).
+    [[ "$last_cmd" == ghostline || "$last_cmd" == ghostline\ * ]] && return
+
+    # Pipelines report the exit code of the last stage only, so a command like
+    # `cat missing.log | grep foo | sort` exits 0 even though cat failed.
+    # We also trigger recovery when the overall exit was 0 but stderr contains
+    # a recognisable error pattern — this catches silent pipeline failures.
+    local _should_recover=0
+    (( exit_code != 0 )) && _should_recover=1
+
+    if (( _should_recover == 0 && exit_code == 0 )) && [[ -f "$GHOSTLINE_STDERR" ]]; then
+        local _probe
+        _probe="$(tail -c +$((_GHOSTLINE_STDERR_OFFSET + 1)) "$GHOSTLINE_STDERR" 2>/dev/null | head -c 200 | tr -d '\0')"
+        if [[ "$_probe" == *"No such file or directory"* || \
+              "$_probe" == *"Permission denied"* || \
+              "$_probe" == *"command not found"* || \
+              "$_probe" == *"cannot open"* || \
+              "$_probe" == *"not found"* ]]; then
+            _should_recover=1
+        fi
+    fi
+
+    if (( _should_recover )); then
         # tee buffers — give it a beat to flush before we read.
         local stderr_content=""
         if [[ -f "$GHOSTLINE_STDERR" ]]; then

@@ -18,7 +18,9 @@ type Context struct {
 	CWD            string      `json:"cwd"`
 	GitBranch      string      `json:"git_branch"`
 	GitRepo        string      `json:"git_repo"`
+	GitStatus      []string    `json:"git_status,omitempty"`
 	ProjectType    string      `json:"project_type"`
+	DirFiles       []string    `json:"dir_files,omitempty"`
 	RecentCommands []CmdRecord `json:"recent_commands"`
 	UpdatedAt      time.Time   `json:"updated_at"`
 }
@@ -31,7 +33,9 @@ type Update struct {
 	Stderr      string
 	GitBranch   string
 	GitRepo     string
+	GitStatus   []string
 	ProjectType string
+	DirFiles    []string
 }
 
 type Store struct {
@@ -79,6 +83,12 @@ func (s *Store) Apply(u Update) {
 	}
 	if u.ProjectType != "" {
 		ctx.ProjectType = u.ProjectType
+	}
+	if len(u.GitStatus) > 0 {
+		ctx.GitStatus = u.GitStatus
+	}
+	if len(u.DirFiles) > 0 {
+		ctx.DirFiles = u.DirFiles
 	}
 	if u.Command != "" {
 		rec := CmdRecord{

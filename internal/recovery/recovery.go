@@ -34,6 +34,11 @@ type Recovery struct {
 type Result struct {
 	Fix string
 	Why string
+	// Source identifies which tier produced the fix: "deterministic" (offline
+	// typo corrector) or "llm" (model). It lets callers decide whether a fix is
+	// worth caching — only LLM fixes are, since deterministic ones are already
+	// instant.
+	Source string
 }
 
 func New(gen generator, timeoutMS int) *Recovery {
@@ -41,9 +46,12 @@ func New(gen generator, timeoutMS int) *Recovery {
 }
 
 func (r *Recovery) Recover(cmd string, exitCode int, stderr string, ctx *session.Context) (*Result, error) {
-	// Tier 1: fast, deterministic, offline. Handles the common case (a mistyped
-	// command) instantly and avoids an API round-trip.
+	// Tier 1: fast, deterministic, offline. Corrects an unambiguous single-token
+	// typo (`gti` → `git`) instantly on every backend, with no API round-trip —
+	// these are high-confidence and can't really be wrong. Multi-token lines fall
+	// through so the LLM can correct the whole line, including mistyped arguments.
 	if res := tryDeterministic(cmd, exitCode, stderr); res != nil {
+		res.Source = "deterministic"
 		return res, nil
 	}
 
@@ -58,7 +66,11 @@ func (r *Recovery) Recover(cmd string, exitCode int, stderr string, ctx *session
 		return nil, err
 	}
 
-	return parseResponse(response), nil
+	res := parseResponse(response)
+	if res != nil {
+		res.Source = "llm"
+	}
+	return res, nil
 }
 
 func parseResponse(response string) *Result {
@@ -81,19 +93,27 @@ func parseResponse(response string) *Result {
 		return nil
 	}
 
-	// The FIX must be a runnable command (the shell pre-fills it into the buffer
-	// to run on Enter). Models sometimes inline the explanation as
-	// "command — reason"; a Unicode dash never appears in a real shell command, so
-	// split it off and treat the tail as the WHY when one isn't already present.
+	// Models sometimes inline the explanation as "command — reason". Split on a
+	// Unicode dash only when it's surrounded by spaces — that's the separator
+	// usage. A dash with no surrounding spaces is part of a filename or argument
+	// (e.g. "cat notes—2024.txt") and must not be touched.
 	if i, size := indexDash(result.Fix); i >= 0 {
-		tail := strings.TrimSpace(result.Fix[i+size:])
-		result.Fix = strings.TrimSpace(result.Fix[:i])
-		if result.Why == "" {
-			result.Why = tail
+		before := result.Fix[:i]
+		after := result.Fix[i+size:]
+		if strings.HasSuffix(before, " ") && strings.HasPrefix(after, " ") {
+			tail := strings.TrimSpace(after)
+			result.Fix = strings.TrimSpace(before)
+			if result.Why == "" {
+				result.Why = tail
+			}
 		}
 	}
 
 	if result.Fix == "" {
+		return nil
+	}
+	// A fix that begins with a Unicode dash is not a runnable command.
+	if i, _ := indexDash(result.Fix); i == 0 {
 		return nil
 	}
 	return result

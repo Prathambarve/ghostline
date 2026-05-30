@@ -7,6 +7,19 @@ import (
 	"github.com/prathamesh/ghostline/internal/session"
 )
 
+// SamplePrompt returns a representative recovery prompt for benchmarking, so
+// latency measurements reflect a realistic payload size. MaxTokens mirrors the
+// 120-token cap used by Recover.
+func SamplePrompt() (prompt string, maxTokens int) {
+	ctx := &session.Context{
+		CWD:         "/Users/dev/project",
+		GitBranch:   "main",
+		GitRepo:     "ghostline",
+		ProjectType: "go",
+	}
+	return buildPrompt("gitt stauts", 127, "command not found: gitt", ctx), 120
+}
+
 func buildPrompt(cmd string, exitCode int, stderr string, ctx *session.Context) string {
 	var sb strings.Builder
 

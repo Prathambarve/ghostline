@@ -109,7 +109,7 @@ func TestTryDeterministic(t *testing.T) {
 		},
 		{
 			name:     "has arguments -> defer to LLM for full-line correction",
-			cmd:      "gitt stauts",
+			cmd:      "gitt status",
 			exitCode: 127,
 			stderr:   "command not found: gitt",
 			wantNil:  true,

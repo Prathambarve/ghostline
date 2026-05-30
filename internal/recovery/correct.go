@@ -34,6 +34,8 @@ var knownTypos = map[string]string{
 // It deliberately only handles the no-argument case: when arguments are present
 // they may themselves contain typos (e.g. "gitt stauts" → the user wants
 // "git status", not "git stauts"), and only the LLM can correct the whole line.
+// Single-token typos, by contrast, are high-confidence and worth doing instantly
+// on every backend.
 func tryDeterministic(cmd string, exitCode int, stderr string) *Result {
 	// Only act on "command not found" situations to avoid clobbering commands
 	// that failed for real (a valid command with a runtime error).

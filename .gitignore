@@ -1,5 +1,11 @@
 # binary
-ghostline
+/ghostline
+
+# prebuilt release binaries — shipped as GitHub Release assets, not committed
+/ghostline-linux-amd64
+/ghostline-linux-arm64
+/ghostline-darwin-amd64
+/ghostline-darwin-arm64
 
 # macOS
 .DS_Store
