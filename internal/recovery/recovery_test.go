@@ -46,6 +46,26 @@ func TestParseResponse(t *testing.T) {
 			wantNil:  true,
 		},
 		{
+			name:     "NONE on the FIX line must not leak as a command",
+			response: "FIX: NONE",
+			wantNil:  true,
+		},
+		{
+			name:     "NONE on FIX line even with a WHY",
+			response: "FIX: NONE\nWHY: cannot determine a fix",
+			wantNil:  true,
+		},
+		{
+			name:     "lowercase none",
+			response: "none",
+			wantNil:  true,
+		},
+		{
+			name:     "NONE wrapped in backticks/punctuation",
+			response: "`NONE`.",
+			wantNil:  true,
+		},
+		{
 			name:     "empty",
 			response: "",
 			wantNil:  true,
@@ -74,6 +94,33 @@ func TestParseResponse(t *testing.T) {
 					tt.response, got.Fix, got.Why, tt.wantFix, tt.wantWhy)
 			}
 		})
+	}
+}
+
+func TestSuggestsInstall(t *testing.T) {
+	install := []string{
+		"brew install clde && clde --version",
+		"sudo apt-get install htop",
+		"pip install requests",
+		"npm install -g typescript",
+		"cargo install ripgrep",
+		"PACMAN -S foo", // case-insensitive
+	}
+	for _, fix := range install {
+		if !suggestsInstall(fix) {
+			t.Errorf("suggestsInstall(%q) = false, want true", fix)
+		}
+	}
+	notInstall := []string{
+		"git status",
+		"claude --version",
+		"chmod +x ./deploy.sh && ./deploy.sh",
+		"cd ../project && make",
+	}
+	for _, fix := range notInstall {
+		if suggestsInstall(fix) {
+			t.Errorf("suggestsInstall(%q) = true, want false", fix)
+		}
 	}
 }
 
@@ -108,11 +155,25 @@ func TestTryDeterministic(t *testing.T) {
 			wantFix:  "ls",
 		},
 		{
-			name:     "has arguments -> defer to LLM for full-line correction",
+			name:     "fuzzy typo with arguments -> defer to LLM for full-line correction",
 			cmd:      "gitt status",
 			exitCode: 127,
 			stderr:   "command not found: gitt",
 			wantNil:  true,
+		},
+		{
+			name:     "known typo WITH arguments corrects the command name, keeps args",
+			cmd:      "clde --version",
+			exitCode: 127,
+			stderr:   "zsh: command not found: clde",
+			wantFix:  "claude --version",
+		},
+		{
+			name:     "known typo clde -> claude (single token)",
+			cmd:      "clde",
+			exitCode: 127,
+			stderr:   "zsh: command not found: clde",
+			wantFix:  "claude",
 		},
 		{
 			name:     "real command real error is left to the LLM",

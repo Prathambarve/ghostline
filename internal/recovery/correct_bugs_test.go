@@ -122,8 +122,13 @@ func TestTryDeterministicEdgeCases(t *testing.T) {
 			wantNil: true,
 		},
 		{
-			name:    "multi-token defers to LLM",
+			name:    "known typo with args corrects the command name, keeps args",
 			cmd:     "gti status", exit: 127, stderr: "command not found: gti",
+			wantFix: "git status",
+		},
+		{
+			name:    "fuzzy (non-curated) typo with args still defers to LLM",
+			cmd:     "gitt status", exit: 127, stderr: "command not found: gitt",
 			wantNil: true,
 		},
 

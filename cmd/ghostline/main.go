@@ -12,6 +12,7 @@ import (
 	"github.com/prathamesh/ghostline/internal/completion"
 	"github.com/prathamesh/ghostline/internal/config"
 	"github.com/prathamesh/ghostline/internal/daemon"
+	"github.com/prathamesh/ghostline/internal/envprobe"
 	"github.com/prathamesh/ghostline/internal/llm"
 	"github.com/prathamesh/ghostline/internal/secret"
 	"github.com/spf13/cobra"
@@ -172,7 +173,7 @@ func printCandidatesTSV(cands []completion.Candidate) {
 }
 
 func recoverCmd() *cobra.Command {
-	var cmdStr, sessionID, stderr string
+	var cmdStr, sessionID, stderr, cwd string
 	var exitCode int
 	cmd := &cobra.Command{
 		Use:   "recover",
@@ -184,12 +185,22 @@ func recoverCmd() *cobra.Command {
 			if err := daemon.EnsureDaemon(); err != nil {
 				return nil
 			}
+
+			// Probe the environment client-side: this process is a child of the
+			// interactive shell, so it sees the real PATH and $VIRTUAL_ENV that
+			// the detached daemon cannot. Gated by the privacy knob.
+			var envContext string
+			if cfg, err := config.Load(); err == nil && cfg.SendEnvProbe {
+				envContext = envprobe.Probe(cmdStr, cwd).Prompt()
+			}
+
 			resp, err := daemon.SendRequest(daemon.Request{
-				Type:      "recover",
-				SessionID: sessionID,
-				Command:   cmdStr,
-				ExitCode:  exitCode,
-				Stderr:    stderr,
+				Type:       "recover",
+				SessionID:  sessionID,
+				Command:    cmdStr,
+				ExitCode:   exitCode,
+				Stderr:     stderr,
+				EnvContext: envContext,
 			})
 			if err != nil || resp == nil || resp.Type != "recovery" || resp.Fix == "" {
 				return nil
@@ -206,6 +217,7 @@ func recoverCmd() *cobra.Command {
 	cmd.Flags().StringVar(&cmdStr, "cmd", "", "the failed command")
 	cmd.Flags().StringVar(&sessionID, "session", "", "shell session ID")
 	cmd.Flags().StringVar(&stderr, "stderr", "", "stderr output from failed command")
+	cmd.Flags().StringVar(&cwd, "cwd", "", "working directory of the failed command")
 	cmd.Flags().IntVar(&exitCode, "exit-code", 1, "exit code of failed command")
 	return cmd
 }
@@ -435,6 +447,7 @@ func applyRecommendedPrivacy(cfg *config.Config) {
 	cfg.SendDirFiles = true
 	cfg.SendRecentCommands = true
 	cfg.SendStderr = true
+	cfg.SendEnvProbe = true
 }
 
 func applyStrictPrivacy(cfg *config.Config) {
@@ -445,6 +458,7 @@ func applyStrictPrivacy(cfg *config.Config) {
 	cfg.SendDirFiles = false
 	cfg.SendRecentCommands = false
 	cfg.SendStderr = false
+	cfg.SendEnvProbe = false
 }
 
 func applyCustomPrivacy(reader *bufio.Reader, cfg *config.Config) {
@@ -457,6 +471,7 @@ func applyCustomPrivacy(reader *bufio.Reader, cfg *config.Config) {
 	cfg.SendDirFiles = promptYesNo(reader, "Send nearby file names for better completions? (Recommended: yes)", true)
 	cfg.SendRecentCommands = promptYesNo(reader, "Send recent commands from this shell session? (Recommended: yes)", true)
 	cfg.SendStderr = promptYesNo(reader, "Send stderr from failed commands for recovery? (Recommended: yes)", true)
+	cfg.SendEnvProbe = promptYesNo(reader, "Probe local tool versions/paths on errors for sharper recovery? (Recommended: yes)", true)
 }
 
 func promptYesNo(reader *bufio.Reader, question string, recommended bool) bool {
@@ -484,13 +499,14 @@ func promptYesNo(reader *bufio.Reader, question string, recommended bool) bool {
 func printPrivacySummary(cfg *config.Config) {
 	fmt.Printf("backend: %s (model: %s)\n", cfg.Backend, backendModel(cfg))
 	fmt.Printf("history: %s\n", enabledText(cfg.HistoryEnabled))
-	fmt.Printf("context sent: cwd=%s git_remote=%s git_status=%s dir_files=%s recent_commands=%s stderr=%s\n",
+	fmt.Printf("context sent: cwd=%s git_remote=%s git_status=%s dir_files=%s recent_commands=%s stderr=%s env_probe=%s\n",
 		enabledText(cfg.SendCWD),
 		enabledText(cfg.SendGitRemote),
 		enabledText(cfg.SendGitStatus),
 		enabledText(cfg.SendDirFiles),
 		enabledText(cfg.SendRecentCommands),
 		enabledText(cfg.SendStderr),
+		enabledText(cfg.SendEnvProbe),
 	)
 }
 

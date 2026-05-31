@@ -45,7 +45,7 @@ func New(gen generator, timeoutMS int) *Recovery {
 	return &Recovery{gen: gen, timeoutMS: timeoutMS}
 }
 
-func (r *Recovery) Recover(cmd string, exitCode int, stderr string, ctx *session.Context) (*Result, error) {
+func (r *Recovery) Recover(cmd string, exitCode int, stderr, envContext string, ctx *session.Context) (*Result, error) {
 	// Tier 1: fast, deterministic, offline. Corrects an unambiguous single-token
 	// typo (`gti` → `git`) instantly on every backend, with no API round-trip —
 	// these are high-confidence and can't really be wrong. Multi-token lines fall
@@ -55,8 +55,9 @@ func (r *Recovery) Recover(cmd string, exitCode int, stderr string, ctx *session
 		return res, nil
 	}
 
-	// Tier 2: fall through to the model for anything the ruleset can't solve.
-	prompt := buildPrompt(cmd, exitCode, stderr, ctx)
+	// Tier 2: fall through to the model for anything the ruleset can't solve. The
+	// env context (tool version/path, project pins, venv) sharpens its diagnosis.
+	prompt := buildPrompt(cmd, exitCode, stderr, envContext, ctx)
 
 	tctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.timeoutMS)*time.Millisecond)
 	defer cancel()
@@ -68,14 +69,54 @@ func (r *Recovery) Recover(cmd string, exitCode int, stderr string, ctx *session
 
 	res := parseResponse(response)
 	if res != nil {
+		// Never pre-fill an unverifiable install for a "command not found": we
+		// can't confirm a package exists offline, so a guessed `brew install <X>`
+		// for what may be a typo is worse than no suggestion. Real typos are
+		// handled by tryDeterministic or by the model returning the intended
+		// command instead.
+		if isCommandNotFound(exitCode, stderr) && suggestsInstall(res.Fix) {
+			return nil, nil
+		}
 		res.Source = "llm"
 	}
 	return res, nil
 }
 
+// installPrefixes are command starts that install software. A recovery that tells
+// the user to install a missing command is suppressed for "command not found"
+// failures (see Recover) — the package name can't be verified offline.
+var installPrefixes = []string{
+	"brew install", "brew reinstall",
+	"apt install", "apt-get install", "dnf install", "yum install",
+	"pacman -s", "port install", "snap install", "nix-env",
+	"pip install", "pip3 install", "pipx install",
+	"npm install -g", "npm i -g", "pnpm add -g", "yarn global add",
+	"gem install", "cargo install", "go install", "uv tool install",
+}
+
+// suggestsInstall reports whether fix is an "install this software" command.
+func suggestsInstall(fix string) bool {
+	f := strings.TrimSpace(strings.ToLower(fix))
+	f = strings.TrimSpace(strings.TrimPrefix(f, "sudo "))
+	for _, p := range installPrefixes {
+		if strings.HasPrefix(f, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isNone reports whether s is the model's "no fix" sentinel. It tolerates case
+// and the quotes/backticks/trailing punctuation models sometimes wrap it in, so
+// a non-answer never leaks into the user's prompt buffer as the literal "NONE".
+func isNone(s string) bool {
+	s = strings.Trim(strings.TrimSpace(s), "`\"'.")
+	return strings.EqualFold(strings.TrimSpace(s), "NONE")
+}
+
 func parseResponse(response string) *Result {
 	response = strings.TrimSpace(response)
-	if response == "NONE" || response == "" {
+	if response == "" || isNone(response) {
 		return nil
 	}
 
@@ -89,7 +130,9 @@ func parseResponse(response string) *Result {
 		}
 	}
 
-	if result.Fix == "" {
+	// "NONE" on the FIX line (a common way the model formats "no fix") must never
+	// become a pre-filled command.
+	if result.Fix == "" || isNone(result.Fix) {
 		return nil
 	}
 

@@ -30,6 +30,10 @@ type Config struct {
 	SendDirFiles       bool   `yaml:"send_dir_files"`
 	SendRecentCommands bool   `yaml:"send_recent_commands"`
 	SendStderr         bool   `yaml:"send_stderr"`
+	// SendEnvProbe lets recovery run bounded local probes (which/--version,
+	// version-file reads) for the failing tool and send those facts for sharper
+	// environment diagnoses. Off in the strict profile.
+	SendEnvProbe bool `yaml:"send_env_probe"`
 }
 
 func Default() *Config {
@@ -49,6 +53,7 @@ func Default() *Config {
 		SendDirFiles:        true,
 		SendRecentCommands:  true,
 		SendStderr:          true,
+		SendEnvProbe:        true,
 	}
 }
 

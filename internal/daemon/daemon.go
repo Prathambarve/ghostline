@@ -35,6 +35,11 @@ const maxFixCacheLines = 2000
 // later if the user happens to type the same command.
 const offerTTL = 5 * time.Minute
 
+// correctionTTL bounds how long a failed command waits for the user's own
+// correction. Self-correction looks only at the immediately-following command, so
+// this just discards a stale failure if the user walks away mid-fix.
+const correctionTTL = 2 * time.Minute
+
 // frequentSuggestions is how many cross-session commands we surface to the model.
 const frequentSuggestions = 10
 
@@ -50,6 +55,10 @@ type Request struct {
 	Command   string `json:"cmd"`
 	ExitCode  int    `json:"exit_code"`
 	Stderr    string `json:"stderr"`
+	// EnvContext is a pre-rendered block of environment facts (tool version/path,
+	// project version pins, active venv) gathered client-side by `ghostline
+	// recover`, which runs in the shell and so sees the real PATH/$VIRTUAL_ENV.
+	EnvContext string `json:"env_context"`
 }
 
 type Response struct {
@@ -76,6 +85,16 @@ type offer struct {
 	at     time.Time
 }
 
+// failure is the last command that failed in a session, awaiting the user's own
+// correction. If their next command is a close, successful match we learn it as a
+// fix even though Ghostline never offered it (self-correction learning).
+type failure struct {
+	cmd    string
+	stderr string
+	repo   string
+	at     time.Time
+}
+
 type Server struct {
 	cfg       *config.Config
 	store     *session.Store
@@ -86,6 +105,9 @@ type Server struct {
 
 	offersMu sync.Mutex
 	offers   map[string]offer // sessionID → last LLM fix awaiting acceptance
+
+	lastFailMu sync.Mutex
+	lastFail   map[string]failure // sessionID → last failed command awaiting a self-correction
 }
 
 func NewServer(cfg *config.Config) *Server {
@@ -108,6 +130,7 @@ func NewServer(cfg *config.Config) *Server {
 		completer: completion.New(gen, cfg.CompletionTimeoutMS),
 		recoverer: recovery.New(gen, cfg.RecoveryTimeoutMS),
 		offers:    make(map[string]offer),
+		lastFail:  make(map[string]failure),
 	}
 }
 
@@ -246,8 +269,27 @@ func (s *Server) handleRecover(req Request) Response {
 	if !s.cfg.SendStderr {
 		stderr = ""
 	}
+	envContext := req.EnvContext
+	if !s.cfg.SendEnvProbe {
+		envContext = "" // defense in depth; the client should not have sent it
+	}
 	if !s.cfg.SendRecentCommands {
 		ctx.RecentCommands = nil
+	}
+
+	// Remember this failure so that if the user's very next command is a close
+	// correction we can learn it even though we never offered it (self-correction
+	// learning). Recorded here, not in handleUpdateContext, because this is where
+	// the real stderr lives — so the learned key matches a future lookup.
+	if s.fixcache != nil {
+		s.lastFailMu.Lock()
+		s.lastFail[req.SessionID] = failure{
+			cmd:    strings.TrimSpace(req.Command),
+			stderr: stderr,
+			repo:   ctx.GitRepo,
+			at:     time.Now(),
+		}
+		s.lastFailMu.Unlock()
 	}
 
 	// Tier 0: replay a fix the user previously accepted for this exact failure —
@@ -258,7 +300,7 @@ func (s *Server) handleRecover(req Request) Response {
 		}
 	}
 
-	result, err := s.recoverer.Recover(req.Command, req.ExitCode, stderr, &ctx)
+	result, err := s.recoverer.Recover(req.Command, req.ExitCode, stderr, envContext, &ctx)
 	if err != nil || result == nil {
 		return Response{Type: "none"}
 	}
@@ -332,6 +374,117 @@ func (s *Server) learnIfAccepted(sessionID, command string, exitCode int) {
 	s.fixcache.Learn(o.cmd, o.stderr, o.repo, o.fix, o.why) //nolint:errcheck
 }
 
+// learnSelfCorrection records a fix the user discovered on their own: when a
+// command succeeds right after a close-but-failed command, that success is the
+// correction, so the next identical failure replays it instantly and offline — no
+// model call, no prior offer. Only the command immediately following the failure
+// is considered (any other success consumes the pending failure), which keeps
+// unrelated back-to-back commands from being mistaken for a fix.
+func (s *Server) learnSelfCorrection(sessionID, command string, exitCode int) {
+	if s.fixcache == nil || exitCode != 0 {
+		return // failures are recorded in handleRecover, where the real stderr lives
+	}
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return
+	}
+
+	s.lastFailMu.Lock()
+	f, ok := s.lastFail[sessionID]
+	if ok {
+		delete(s.lastFail, sessionID) // consume: only the immediately-next success counts
+	}
+	s.lastFailMu.Unlock()
+
+	if !ok || time.Since(f.at) > correctionTTL || !looksLikeCorrection(f.cmd, command) {
+		return
+	}
+	s.fixcache.Learn(f.cmd, f.stderr, f.repo, command, "learned from your earlier correction") //nolint:errcheck
+}
+
+// looksLikeCorrection reports whether fixed is plausibly a typo-correction of
+// failed. The whole command must be a close edit AND the command name (first
+// token) must match or itself be a close typo — the latter stops a shared
+// argument from making two different commands look like a correction (e.g.
+// "cat a.txt" vs "rm a.txt"). The length floor and per-three-characters edit
+// budget keep unrelated short commands ("ls" then "cd") and same-verb-different-
+// subcommand pairs ("git status" then "git push") from being learned.
+func looksLikeCorrection(failed, fixed string) bool {
+	failed, fixed = strings.TrimSpace(failed), strings.TrimSpace(fixed)
+	if failed == "" || fixed == "" || failed == fixed {
+		return false
+	}
+	if !closeEdit(failed, fixed) {
+		return false
+	}
+	tf, tx := firstField(failed), firstField(fixed)
+	return tf == tx || closeEdit(tf, tx)
+}
+
+// closeEdit reports whether a and b are within ~one edit per three characters,
+// with a length floor so two short, different tokens don't qualify.
+func closeEdit(a, b string) bool {
+	maxLen := len(a)
+	if len(b) > maxLen {
+		maxLen = len(b)
+	}
+	if maxLen < 3 {
+		return false
+	}
+	d := osaDistance(a, b)
+	return d >= 1 && d*3 <= maxLen+2
+}
+
+func firstField(s string) string {
+	if i := strings.IndexByte(s, ' '); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// osaDistance is the optimal string alignment distance (Levenshtein plus adjacent
+// transpositions, which are the most common typo), computed over bytes with three
+// rolling rows.
+func osaDistance(a, b string) int {
+	la, lb := len(a), len(b)
+	if la == 0 {
+		return lb
+	}
+	if lb == 0 {
+		return la
+	}
+	prev2 := make([]int, lb+1)
+	prev := make([]int, lb+1)
+	curr := make([]int, lb+1)
+	for j := 0; j <= lb; j++ {
+		prev[j] = j
+	}
+	for i := 1; i <= la; i++ {
+		curr[0] = i
+		for j := 1; j <= lb; j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			m := prev[j] + 1 // deletion
+			if ins := curr[j-1] + 1; ins < m {
+				m = ins
+			}
+			if sub := prev[j-1] + cost; sub < m {
+				m = sub
+			}
+			if i > 1 && j > 1 && a[i-1] == b[j-2] && a[i-2] == b[j-1] {
+				if t := prev2[j-2] + 1; t < m {
+					m = t
+				}
+			}
+			curr[j] = m
+		}
+		prev2, prev, curr = prev, curr, prev2
+	}
+	return prev[lb]
+}
+
 func (s *Server) handleUpdateContext(req Request) Response {
 	var gitBranch, gitRepo, projectType string
 	var gitStatus, dirFiles []string
@@ -381,6 +534,10 @@ func (s *Server) handleUpdateContext(req Request) Response {
 	// (not the privacy-gated one) since acceptance is matched against the fix we
 	// actually suggested.
 	s.learnIfAccepted(req.SessionID, req.Command, req.ExitCode)
+
+	// If this successful command is a close correction of the command that just
+	// failed, learn it on the user's behalf — the offline flywheel.
+	s.learnSelfCorrection(req.SessionID, req.Command, req.ExitCode)
 
 	// Persist a redacted record for cross-session recall (best-effort; secrets
 	// are dropped/masked inside history.Append).

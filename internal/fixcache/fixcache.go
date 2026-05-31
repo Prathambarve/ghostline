@@ -43,6 +43,7 @@ type Store struct {
 	mu       sync.Mutex
 	path     string
 	maxLines int
+	appended int // appends since the last compaction (guarded by mu)
 }
 
 // NewStore opens (and compacts) the recovery cache at path, keeping at most
@@ -100,6 +101,29 @@ func (s *Store) Learn(cmd, stderr, repo, fix, why string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Skip a redundant append: if the newest entry for this key already replays
+	// the same fix, re-learning it (e.g. after re-running a previously learned
+	// fix) would only bloat the file. A *different* fix is still appended so the
+	// most-recent correction wins.
+	if latest := latestForKey(s.loadLocked(), e.Cmd, e.StderrHash, e.Repo); latest != nil && latest.Fix == e.Fix {
+		return nil
+	}
+
+	if err := s.appendLocked(e); err != nil {
+		return err
+	}
+	s.appended++
+	// Safety net for a daemon that never restarts: once we've appended a cap's
+	// worth, compact in place (dedupes by key and trims) so the file can't grow
+	// unbounded between restarts.
+	if s.appended >= s.maxLines {
+		s.compactLocked()
+	}
+	return nil
+}
+
+// appendLocked writes one entry; caller holds s.mu.
+func (s *Store) appendLocked(e Entry) error {
 	f, err := os.OpenFile(s.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
@@ -112,6 +136,23 @@ func (s *Store) Learn(cmd, stderr, repo, fix, why string) error {
 	}
 	_, err = f.Write(append(line, '\n'))
 	return err
+}
+
+// latestForKey returns the most-recent entry matching the (cmd, stderr-hash,
+// repo) key, or nil. recs is oldest-first.
+func latestForKey(recs []Entry, cmd, stderrHash, repo string) *Entry {
+	for i := len(recs) - 1; i >= 0; i-- {
+		if recs[i].Cmd == cmd && recs[i].StderrHash == stderrHash && recs[i].Repo == repo {
+			return &recs[i]
+		}
+	}
+	return nil
+}
+
+// key is the dedupe identity of an entry: same key ⇒ same lookup, so only the
+// most-recent one need be kept.
+func key(e Entry) string {
+	return e.Cmd + "\x00" + e.StderrHash + "\x00" + e.Repo
 }
 
 // Lookup returns the most-recently learned fix for an exact (cmd, stderr, repo)
@@ -161,20 +202,51 @@ func (s *Store) loadLocked() []Entry {
 	return recs
 }
 
-// compact trims the file to the last maxLines entries on startup, bounding
-// growth without a background process.
+// compact dedupes and trims the file. Called on startup and as a runtime safety
+// net; bounds growth without a background process.
 func (s *Store) compact() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.compactLocked()
+}
+
+// compactLocked collapses the file to one entry per key (most-recent wins, which
+// matches Lookup) and trims to the last maxLines. Caller holds s.mu. It resets
+// the append counter and only rewrites when something actually changed.
+func (s *Store) compactLocked() {
+	s.appended = 0
 	if s.maxLines <= 0 {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	recs := s.loadLocked()
-	if len(recs) <= s.maxLines {
-		return
+	orig := len(recs)
+
+	// Keep only the most-recent entry per key. Walk newest→oldest, emit first
+	// sighting of each key, then restore oldest-first order.
+	seen := make(map[string]bool, len(recs))
+	deduped := make([]Entry, 0, len(recs))
+	for i := len(recs) - 1; i >= 0; i-- {
+		k := key(recs[i])
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		deduped = append(deduped, recs[i])
 	}
-	recs = recs[len(recs)-s.maxLines:]
+	for i, j := 0, len(deduped)-1; i < j; i, j = i+1, j-1 {
+		deduped[i], deduped[j] = deduped[j], deduped[i]
+	}
+	recs = deduped
+
+	trimmed := false
+	if len(recs) > s.maxLines {
+		recs = recs[len(recs)-s.maxLines:]
+		trimmed = true
+	}
+	if len(recs) == orig && !trimmed {
+		return // no duplicates and under the cap — nothing to rewrite
+	}
 
 	tmp := s.path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)

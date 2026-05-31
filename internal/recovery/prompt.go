@@ -17,10 +17,12 @@ func SamplePrompt() (prompt string, maxTokens int) {
 		GitRepo:     "ghostline",
 		ProjectType: "go",
 	}
-	return buildPrompt("gitt stauts", 127, "command not found: gitt", ctx), 120
+	env := "Environment:\n- python resolves to /usr/bin/python\n- installed version: Python 3.13.1\n- project pins .python-version: 3.10\n"
+	stderr := "SyntaxError: invalid syntax (compatibility issue across Python versions)"
+	return buildPrompt("python app.py", 1, stderr, env, ctx), 120
 }
 
-func buildPrompt(cmd string, exitCode int, stderr string, ctx *session.Context) string {
+func buildPrompt(cmd string, exitCode int, stderr, envContext string, ctx *session.Context) string {
 	var sb strings.Builder
 
 	sb.WriteString("You are a terminal error recovery assistant. Be concise and specific.\n\n")
@@ -32,6 +34,10 @@ func buildPrompt(cmd string, exitCode int, stderr string, ctx *session.Context) 
 			stderr = stderr[:400] + "..."
 		}
 		sb.WriteString(fmt.Sprintf("Error output:\n%s\n", stderr))
+	}
+
+	if envContext != "" {
+		sb.WriteString(envContext)
 	}
 
 	if ctx.CWD != "" {
@@ -50,13 +56,25 @@ func buildPrompt(cmd string, exitCode int, stderr string, ctx *session.Context) 
 		sb.WriteString(fmt.Sprintf("Recent commands: %s\n", strings.Join(names, ", ")))
 	}
 
-	sb.WriteString("\nRespond in this EXACT format (nothing else):\n")
+	sb.WriteString("\nYou fix how a command was INVOKED or the ENVIRONMENT it ran in — not bugs in the user's code. ")
+	sb.WriteString("In scope: an unknown/misspelled command (correct it to the command the user meant), ")
+	sb.WriteString("wrong tool/language version or interpreter, missing module/dependency, inactive or wrong virtualenv, ")
+	sb.WriteString("missing environment variable, permission problem, wrong working directory, malformed flags or arguments.\n")
+	sb.WriteString("OUT OF SCOPE: bugs inside the user's own source code — syntax errors, exceptions from their logic, ")
+	sb.WriteString("failing test assertions, type errors in their files. You are a shell assistant, not a code editor. ")
+	sb.WriteString("If the failure is a bug in the user's source code rather than how it was run or its environment, respond with exactly: NONE\n")
+	sb.WriteString("For a \"command not found\", correct it to the command the user meant (e.g. \"clde\" → \"claude\"). ")
+	sb.WriteString("Do NOT suggest installing the missing program — you cannot verify a package exists, and a guessed install ")
+	sb.WriteString("for a misspelling is worse than nothing. If you cannot identify the intended command, respond with exactly NONE.\n\n")
+
+	sb.WriteString("Respond in this EXACT format (nothing else):\n")
 	sb.WriteString("FIX: <the corrected command to run — runnable as-is>\n")
-	sb.WriteString("WHY: <one short clause explaining the cause>\n\n")
+	sb.WriteString("WHY: <one or two short clauses naming the concrete cause>\n\n")
 	sb.WriteString("FIX must be ONLY the runnable command — no explanation, no dash, nothing after it ")
 	sb.WriteString("(the user runs it by pressing Enter); put all reasoning on the WHY line instead. ")
 	sb.WriteString("If the command has typos, correct ALL of them, including arguments. ")
-	sb.WriteString("Always include a brief WHY (a few words).\n\n")
+	sb.WriteString("Cite the environment facts in WHY when they explain the failure ")
+	sb.WriteString("(e.g. \"python 3.13 is active but .python-version pins 3.10\"). Always include a brief WHY.\n\n")
 	sb.WriteString("Example — for the failed command \"gitt stauts\":\n")
 	sb.WriteString("FIX: git status\n")
 	sb.WriteString("WHY: \"gitt\" and \"stauts\" were misspelled\n\n")

@@ -220,6 +220,7 @@ _ghostline_precmd() {
                 --session "$GHOSTLINE_SESSION" \
                 --cmd "$last_cmd" \
                 --exit-code "$exit_code" \
+                --cwd "$PWD" \
                 --stderr "$stderr_content" 2>/dev/null)"
             if [[ -n "$recovery" ]]; then
                 # The binary returns the runnable fix on line 1 and an optional

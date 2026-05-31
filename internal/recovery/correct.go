@@ -10,6 +10,7 @@ var commonCommands = []string{
 	"curl", "wget", "mkdir", "rm", "cp", "mv", "echo", "vim", "nano", "less",
 	"brew", "cargo", "rustc", "java", "ruby", "sed", "awk", "tar", "ps",
 	"kill", "clear", "exit", "sudo", "chmod", "chown", "touch", "head", "tail",
+	"claude", "code",
 }
 
 // knownTypos maps unambiguous, high-frequency misspellings straight to the
@@ -24,45 +25,60 @@ var knownTypos = map[string]string{
 	"claer": "clear", "clera": "clear",
 	"exti": "exit", "eixt": "exit",
 	"sudp": "sudo", "suod": "sudo",
-	"cta": "cat",
+	"cta":  "cat",
+	"clde": "claude", "cluade": "claude", "cladue": "claude", "calude": "claude",
 }
 
-// tryDeterministic fixes the simplest, unambiguous error — a single mistyped
-// command name with no arguments — without calling the LLM. It returns a
-// *Result on a confident fix, or nil to fall through to the model.
-//
-// It deliberately only handles the no-argument case: when arguments are present
-// they may themselves contain typos (e.g. "gitt stauts" → the user wants
-// "git status", not "git stauts"), and only the LLM can correct the whole line.
-// Single-token typos, by contrast, are high-confidence and worth doing instantly
-// on every backend.
-func tryDeterministic(cmd string, exitCode int, stderr string) *Result {
-	// Only act on "command not found" situations to avoid clobbering commands
-	// that failed for real (a valid command with a runtime error).
+// isCommandNotFound reports whether a failure is a "command not found" situation
+// — i.e. the command name itself wasn't resolvable, as opposed to a valid command
+// failing at runtime.
+func isCommandNotFound(exitCode int, stderr string) bool {
 	lower := strings.ToLower(stderr)
-	notFound := exitCode == 127 ||
+	return exitCode == 127 ||
 		strings.Contains(lower, "command not found") ||
 		strings.Contains(lower, "not found")
-	if !notFound {
+}
+
+// tryDeterministic fixes a mistyped command name without calling the LLM. It
+// returns a *Result on a confident fix, or nil to fall through to the model.
+//
+//   - A curated, exact typo (knownTypos) is high-confidence even with arguments
+//     present: we correct just the command name and keep the rest of the line.
+//   - Fuzzy edit-distance matching is restricted to the no-argument case — with
+//     args, a near-miss token might be exactly what the user meant ("gitt stauts"
+//     wants "git status", not "git stauts"), so that goes to the LLM.
+func tryDeterministic(cmd string, exitCode int, stderr string) *Result {
+	if !isCommandNotFound(exitCode, stderr) {
 		return nil
 	}
 
 	fields := strings.Fields(cmd)
-	if len(fields) != 1 {
-		// Multi-token (has arguments) → let the LLM correct the full line.
+	if len(fields) == 0 {
 		return nil
 	}
 	name := fields[0]
+
+	if to, ok := knownTypos[name]; ok {
+		fix := to
+		if len(fields) > 1 {
+			fix += " " + strings.Join(fields[1:], " ")
+		}
+		return &Result{Fix: fix, Why: typoWhy(name, to)}
+	}
+
+	if len(fields) != 1 {
+		return nil // fuzzy correction only when there are no arguments
+	}
 
 	corrected := correctToken(name)
 	if corrected == "" || corrected == name {
 		return nil
 	}
+	return &Result{Fix: corrected, Why: typoWhy(name, corrected)}
+}
 
-	return &Result{
-		Fix: corrected,
-		Why: "\"" + name + "\" isn't a command — did you mean \"" + corrected + "\"?",
-	}
+func typoWhy(name, corrected string) string {
+	return "\"" + name + "\" isn't a command — did you mean \"" + corrected + "\"?"
 }
 
 // correctToken returns the intended command for a mistyped one, or "" if it

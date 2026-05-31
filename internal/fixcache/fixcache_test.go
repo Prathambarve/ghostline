@@ -1,6 +1,7 @@
 package fixcache
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 )
@@ -113,11 +114,46 @@ func TestCompactTrimsToMaxLines(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "recoveries.jsonl")
 	s := NewStore(path, 10)
 	for i := 0; i < 25; i++ {
-		s.Learn("cmd", "err", "repo", "fix", "")
+		s.Learn(fmt.Sprintf("cmd%d", i), "err", "repo", "fix", "") // distinct keys
 	}
 	s2 := NewStore(path, 10)
 	if recs := s2.load(); len(recs) != 10 {
 		t.Errorf("expected compaction to 10 lines, got %d", len(recs))
+	}
+}
+
+// Re-learning the same fix for the same failure must not grow the file — this is
+// the replay-then-rerun case (a known typo fixed again) that previously appended
+// a duplicate line every time.
+func TestLearnDedupesIdenticalFix(t *testing.T) {
+	s := newTempStore(t)
+	for i := 0; i < 50; i++ {
+		s.Learn("clde", "command not found: clde", "", "claude", "learned from your earlier correction")
+	}
+	if recs := s.load(); len(recs) != 1 {
+		t.Errorf("identical re-learns should collapse to 1 entry, got %d", len(recs))
+	}
+	if e := s.Lookup("clde", "command not found: clde", ""); e == nil || e.Fix != "claude" {
+		t.Errorf("expected to replay claude, got %+v", e)
+	}
+}
+
+// A *changed* fix for the same failure is recorded (most-recent wins), and
+// compaction collapses the key's history to just the latest.
+func TestLearnUpdatesChangedFix(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recoveries.jsonl")
+	s := NewStore(path, 2000)
+	s.Learn("foo", "err", "", "fix-v1", "")
+	s.Learn("foo", "err", "", "fix-v2", "")
+	if e := s.Lookup("foo", "err", ""); e == nil || e.Fix != "fix-v2" {
+		t.Fatalf("expected newest fix-v2, got %+v", e)
+	}
+	s2 := NewStore(path, 2000) // triggers startup compaction → dedupe by key
+	if recs := s2.load(); len(recs) != 1 {
+		t.Errorf("compaction should keep one entry per key, got %d", len(recs))
+	}
+	if e := s2.Lookup("foo", "err", ""); e == nil || e.Fix != "fix-v2" {
+		t.Errorf("compaction must preserve the most-recent fix, got %+v", e)
 	}
 }
 
