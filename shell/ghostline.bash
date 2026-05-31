@@ -7,7 +7,7 @@
 # once, guarded by _GHOSTLINE_SETUP_DONE.
 
 if ! command -v ghostline &>/dev/null; then
-    echo "ghostline: binary not found. Run: curl -fsSL https://ghostline.dev/install.sh | sh" >&2
+    echo "ghostline: binary not found. Run: curl -fsSL https://raw.githubusercontent.com/Prathambarve/ghostline/main/scripts/install.sh | bash" >&2
     return 1
 fi
 
@@ -65,12 +65,14 @@ _ghostline_precmd() {
     [[ -z "$last_cmd" ]] && return
     [[ "$last_cmd" == ghostline || "$last_cmd" == ghostline\ * ]] && return
 
-    # Context update: async, fire-and-forget
+    # Context update: async, fire-and-forget. The `( … & )` form backgrounds the
+    # job INSIDE a subshell, so bash's job control never prints a "[N] Done …"
+    # line at the next prompt (plain `( … ) &` does, which is just noise here).
     ( ghostline context update \
         --session "$GHOSTLINE_SESSION" \
         --cmd "$last_cmd" \
         --exit-code "$exit_code" \
-        --cwd "$PWD" &>/dev/null ) &
+        --cwd "$PWD" &>/dev/null & )
 
     # Pipeline exit code fix: also trigger recovery when stderr has error
     # patterns even if the overall exit was 0 (e.g. cat bad.log | sort).
@@ -157,6 +159,6 @@ if [[ -z "${_GHOSTLINE_SETUP_DONE:-}" ]]; then
     _GHOSTLINE_STDERR_OFFSET=0
     _GHOSTLINE_NEXT_IS_USER_CMD=1  # first prompt is ready — next cmd is user's
 
-    # Auto-start daemon
-    { ghostline status &>/dev/null || ghostline server --background; } &>/dev/null &
+    # Auto-start daemon (detached; `( … & )` avoids a job-control "Done" message).
+    ( { ghostline status &>/dev/null || ghostline server --background; } &>/dev/null & )
 fi
