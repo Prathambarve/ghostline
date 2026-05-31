@@ -21,7 +21,6 @@ import (
 	"github.com/prathamesh/ghostline/internal/llm"
 	"github.com/prathamesh/ghostline/internal/recovery"
 	"github.com/prathamesh/ghostline/internal/session"
-	"github.com/prathamesh/ghostline/internal/workflow"
 )
 
 // maxHistoryLines bounds the persisted command log.
@@ -82,7 +81,6 @@ type Server struct {
 	store     *session.Store
 	history   *history.Store
 	fixcache  *fixcache.Store
-	workflows *workflow.Store
 	completer *completion.Completer
 	recoverer *recovery.Recovery
 
@@ -102,19 +100,11 @@ func NewServer(cfg *config.Config) *Server {
 			fcache = fixcache.NewStore(path, maxFixCacheLines)
 		}
 	}
-	// Workflows are user-authored saved commands, not learned data, so they are
-	// available regardless of the history privacy setting.
-	var wf *workflow.Store
-	if path, err := config.WorkflowsPath(); err == nil {
-		wf = workflow.NewStore(path)
-	}
-
 	return &Server{
 		cfg:       cfg,
 		store:     session.NewStore(cfg.MaxContextCommands),
 		history:   hist,
 		fixcache:  fcache,
-		workflows: wf,
 		completer: completion.New(gen, cfg.CompletionTimeoutMS),
 		recoverer: recovery.New(gen, cfg.RecoveryTimeoutMS),
 		offers:    make(map[string]offer),
@@ -175,8 +165,6 @@ func (s *Server) handleConn(conn net.Conn) {
 		resp = s.handleComplete(req)
 	case "complete_menu":
 		resp = s.handleCompleteMenu(req)
-	case "palette":
-		resp = s.handlePalette(req)
 	case "recover":
 		resp = s.handleRecover(req)
 	case "update_context":
@@ -250,51 +238,6 @@ func (s *Server) handleCompleteMenu(req Request) Response {
 		return Response{Type: "none"}
 	}
 	return Response{Type: "menu", Candidates: cands}
-}
-
-// handlePalette returns the command palette's contents: saved workflows first,
-// then frequently-used commands and likely next commands for this context. All
-// de-duplicated by command, workflows winning ties.
-func (s *Server) handlePalette(req Request) Response {
-	_, frequent, successors := s.completionContext(req)
-
-	var cands []completion.Candidate
-	if s.workflows != nil {
-		for _, w := range s.workflows.List() {
-			cands = append(cands, completion.Candidate{
-				Command:     w.Command,
-				Description: w.Description,
-				Source:      "workflow",
-			})
-		}
-	}
-	for _, c := range frequent {
-		cands = append(cands, completion.Candidate{Command: c, Source: "frequent"})
-	}
-	for _, c := range successors {
-		cands = append(cands, completion.Candidate{Command: c, Source: "next"})
-	}
-
-	cands = dedupeCandidates(cands)
-	if len(cands) == 0 {
-		return Response{Type: "none"}
-	}
-	return Response{Type: "palette", Candidates: cands}
-}
-
-// dedupeCandidates keeps the first occurrence of each command, preserving order
-// (so a workflow shadows the same command surfaced from history).
-func dedupeCandidates(in []completion.Candidate) []completion.Candidate {
-	seen := make(map[string]bool, len(in))
-	out := in[:0]
-	for _, c := range in {
-		if c.Command == "" || seen[c.Command] {
-			continue
-		}
-		seen[c.Command] = true
-		out = append(out, c)
-	}
-	return out
 }
 
 func (s *Server) handleRecover(req Request) Response {

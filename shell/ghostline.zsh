@@ -44,7 +44,7 @@ bindkey '^@' _ghostline_complete       # Ctrl+Space
 bindkey '^ ' _ghostline_complete       # Ctrl+Space (alternate spelling)
 bindkey '^X^G' _ghostline_complete     # Ctrl+X Ctrl+G — terminal-independent fallback
 
-# ── Picker: shared chooser for the completion menu and command palette ────────
+# ── Picker: chooser for the described completion menu ─────────────────────────
 # Reads TSV (`command<TAB>label`) on stdin, shows the labels, and echoes the
 # chosen command (field 1) on stdout. Uses fzf when available; otherwise a small
 # numbered menu. Interactive I/O goes to /dev/tty so it works inside a ZLE widget
@@ -102,14 +102,6 @@ _ghostline_completion_menu() {
 }
 zle -N _ghostline_completion_menu
 bindkey '^X^N' _ghostline_completion_menu
-
-# Ctrl+X Ctrl+P — command palette: pick a saved workflow or a frequent/next
-# command for this directory/repo. Works on an empty buffer.
-_ghostline_palette() {
-    _ghostline_pick_into_buffer ghostline palette --session "$GHOSTLINE_SESSION"
-}
-zle -N _ghostline_palette
-bindkey '^X^P' _ghostline_palette
 
 # ── ZLE: secret guard (warn before running a command that leaks a key) ────────
 # We override accept-line so that pressing Enter on a command containing secret

@@ -62,7 +62,6 @@ internal/session/store.go    — In-memory per-session context (recent commands,
 internal/history/            — Persistent, redacted JSONL command log for cross-session suggestions
 internal/fixcache/           — Learned error→fix cache: replays user-accepted recoveries offline (no API call)
 internal/secret/             — Value-based secret detector (provider key prefixes, secret assignments); backs the prompt guard + history denylist
-internal/workflow/           — User-authored saved commands (YAML), surfaced in the command palette
 internal/completion/menu.go  — Multi-candidate described completions (Candidate type) behind the Fig-style picker
 internal/completion/         — Completion prompt builder + suffix sanitizer + intent-mode prompt
 internal/recovery/           — Error recovery: deterministic typo corrector + LLM prompt/parser
@@ -84,11 +83,9 @@ The Go binary is the single source of truth and is fully cross-platform (Linux/m
 | Error recovery (pre-fill fix) | ✅ | ✅ |
 | Secret guard at the prompt (Phase 3) | ✅ | ❌ not ported |
 | Completion menu — Fig-style (Phase 4) | ✅ | ❌ not ported |
-| Command palette (Phase 4) | ✅ | ❌ not ported |
-| Workflow keybinding (Phase 4) | ✅ | ❌ (CLI `ghostline workflow …` works everywhere; only the keybinding is missing) |
 
 **Why it's not a copy-paste port:** the zsh integration is ZLE-based (`zle -N`, `BUFFER`/`CURSOR`, `zle -M`, the `accept-line` override, `${1:l}`, `print -z`, 1-indexed arrays, the `<->` glob). Bash uses readline instead (`bind -x` with `READLINE_LINE`/`READLINE_POINT`), has no ZLE, no native preexec (DEBUG trap), and 0-indexed arrays. Each feature needs a bash reimplementation. Specifically:
-- **Palette + completion menu** port cleanly via `bind -x` rewriting `READLINE_LINE`; the `_ghostline_pick` helper is mostly portable (drop the `<->` glob and 1-indexed arrays).
+- **Completion menu** ports cleanly via `bind -x` rewriting `READLINE_LINE`; the `_ghostline_pick` helper is mostly portable (drop the `<->` glob and 1-indexed arrays).
 - **Secret guard** is the hard one: bash readline has no clean equivalent of overriding `accept-line` to "swallow Enter, warn, run on the second Enter." A bash port likely has to bind Return via `bind -x` and re-issue the command, which is fiddly and can conflict with other readline setups.
 
 When adding a new shell-facing feature, implement it in `ghostline.zsh` AND `ghostline.bash` (or explicitly record the gap here). New keybindings should use plain control-byte chords like `^X^N` (every terminal transmits these) rather than `Ctrl+Space`/NUL, which several terminals (macOS Terminal.app, default iTerm2) do not send.
@@ -131,15 +128,15 @@ Recovery that learns. When the user **accepts** an LLM recovery — runs the sug
 - **Most-recent wins** on lookup, so a fix the user re-learned (corrected) supersedes an older one.
 - Gated on `history_enabled` (the same local-learning privacy bucket; the strict profile disables it).
 
-### Warp/Fig parity — picker, palette, workflows
+### Described completion menu (Ctrl+X Ctrl+N)
 
-Three features that share one wire shape (`completion.Candidate{Command, Description, Source}`) and one zsh chooser (`_ghostline_pick`, which uses `fzf` if installed and falls back to a numbered tty menu). All three load the chosen command into `BUFFER` — never auto-run, consistent with the rest of Ghostline.
+The "Fig magic": browse several AI-generated completions, each with a one-line description, and pick one.
 
-- **Described completion menu (Ctrl+X Ctrl+N)** — the "Fig magic". `completer.CompleteMenu()` asks the model for up to 5 full-command candidates, each as `command ||| description` (parsed by `parseMenu`), and the picker shows the descriptions. Distinct from `Ctrl+Space`, which stays the instant single-suffix insert — the menu is the opt-in, browse-with-descriptions path. Wire: `{"type":"complete_menu"}` → `Response.Candidates`.
-- **Command palette (Ctrl+X Ctrl+P)** — `{"type":"palette"}` returns saved workflows first, then frequently-used and likely-next commands for the current repo/dir (from `history`), de-duplicated by command (workflows win ties). Works on an empty buffer.
-- **Workflows / saved commands (`internal/workflow/`)** — user-authored command templates in `~/.ghostline/workflows.yaml`, managed by `ghostline workflow add|list|remove|show`. `show --set k=v` expands `{{placeholder}}` tokens; unfilled placeholders are left intact for the user to complete in the buffer. Workflows are explicitly authored (not learned), so they are **not** gated by `history_enabled`.
+- `completer.CompleteMenu()` asks the model for up to 5 full-command candidates, each as `command ||| description` (parsed by `parseMenu`), returned on the wire as `completion.Candidate{Command, Description}`. Wire: `{"type":"complete_menu"}` → `Response.Candidates`.
+- The zsh widget (`_ghostline_completion_menu`) renders them through `_ghostline_pick` — a chooser that uses `fzf` if installed and falls back to a numbered tty menu — and loads the chosen command into `BUFFER` (never auto-run). `ghostline complete-menu` prints the TSV the picker consumes.
+- Distinct from `Ctrl+Space`, which stays the instant single-suffix insert — the menu is the opt-in, browse-with-descriptions path. **Currently zsh-only** (see "Shell integration parity").
 
-The CLI surface: `ghostline complete-menu` and `ghostline palette` print TSV (`command<TAB>label`) for the shell picker; `ghostline workflow …` manages the store directly (no daemon needed). Keybindings live in `ghostline.zsh` and are rebindable. **Currently zsh-only** — the bash front-end has not been ported (see "Shell integration parity").
+This is kept because it's genuinely AI (the model writes the candidates *and* their descriptions). Static-recall conveniences — saved-command/alias managers and fuzzy command palettes — were deliberately **not** kept: a non-AI tool (`alias`, `navi`, `fzf`, `Ctrl+R`, `atuin`) already does them, so they're off-mission for "AI in your shell." Don't re-add them.
 
 ### Secret guard at the prompt (`internal/secret/` + `ghostline guard`)
 

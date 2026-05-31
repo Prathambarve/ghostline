@@ -14,7 +14,6 @@ import (
 	"github.com/prathamesh/ghostline/internal/daemon"
 	"github.com/prathamesh/ghostline/internal/llm"
 	"github.com/prathamesh/ghostline/internal/secret"
-	"github.com/prathamesh/ghostline/internal/workflow"
 	"github.com/spf13/cobra"
 )
 
@@ -29,8 +28,6 @@ func main() {
 		serverCmd(),
 		completeCmd(),
 		completeMenuCmd(),
-		paletteCmd(),
-		workflowCmd(),
 		recoverCmd(),
 		contextCmd(),
 		statusCmd(),
@@ -154,33 +151,6 @@ func completeMenuCmd() *cobra.Command {
 	return cmd
 }
 
-// paletteCmd asks the daemon for the command palette (workflows + frequent +
-// likely-next) and prints it as TSV for the shell picker.
-func paletteCmd() *cobra.Command {
-	var sessionID string
-	cmd := &cobra.Command{
-		Use:   "palette",
-		Short: "List palette entries: saved workflows + frequent/next commands",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := daemon.EnsureDaemon(); err != nil {
-				return nil
-			}
-			resp, err := daemon.SendRequest(daemon.Request{
-				Type:      "palette",
-				SessionID: sessionID,
-				CWD:       cwd(),
-			})
-			if err != nil || resp == nil {
-				return nil
-			}
-			printCandidatesTSV(resp.Candidates)
-			return nil
-		},
-	}
-	cmd.Flags().StringVar(&sessionID, "session", "", "shell session ID")
-	return cmd
-}
-
 // printCandidatesTSV emits one `command\tlabel` line per candidate. The picker
 // displays the label but returns the command (field 1).
 func printCandidatesTSV(cands []completion.Candidate) {
@@ -191,159 +161,14 @@ func printCandidatesTSV(cands []completion.Candidate) {
 		}
 		sb.WriteString(c.Command)
 		sb.WriteByte('\t')
-		sb.WriteString(candidateLabel(c))
+		if c.Description != "" {
+			sb.WriteString(c.Command + "  —  " + c.Description)
+		} else {
+			sb.WriteString(c.Command)
+		}
 		sb.WriteByte('\n')
 	}
 	fmt.Print(sb.String())
-}
-
-// candidateLabel formats the human-facing display line: a source glyph, the
-// command, and the description when present.
-func candidateLabel(c completion.Candidate) string {
-	var glyph string
-	switch c.Source {
-	case "workflow":
-		glyph = "⚡ "
-	case "frequent":
-		glyph = "↻ "
-	case "next":
-		glyph = "→ "
-	}
-	if c.Description != "" {
-		return glyph + c.Command + "  —  " + c.Description
-	}
-	return glyph + c.Command
-}
-
-// workflowCmd manages user-authored saved commands. It talks to the store
-// directly (no daemon) so it works standalone.
-func workflowCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "workflow",
-		Short: "Manage saved commands (workflows)",
-	}
-	cmd.AddCommand(
-		workflowAddCmd(),
-		workflowListCmd(),
-		workflowRemoveCmd(),
-		workflowShowCmd(),
-	)
-	return cmd
-}
-
-func workflowStore() (*workflow.Store, error) {
-	path, err := config.WorkflowsPath()
-	if err != nil {
-		return nil, err
-	}
-	if dir, err := config.Dir(); err == nil {
-		os.MkdirAll(dir, 0700)
-	}
-	return workflow.NewStore(path), nil
-}
-
-func workflowAddCmd() *cobra.Command {
-	var name, command, desc string
-	cmd := &cobra.Command{
-		Use:   "add",
-		Short: "Add or update a saved command",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			store, err := workflowStore()
-			if err != nil {
-				return err
-			}
-			if err := store.Add(workflow.Workflow{Name: name, Command: command, Description: desc}); err != nil {
-				return err
-			}
-			fmt.Printf("saved workflow %q\n", name)
-			return nil
-		},
-	}
-	cmd.Flags().StringVar(&name, "name", "", "workflow name")
-	cmd.Flags().StringVar(&command, "command", "", "command template (may include {{placeholders}})")
-	cmd.Flags().StringVar(&desc, "desc", "", "short description")
-	return cmd
-}
-
-func workflowListCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "list",
-		Short: "List saved commands",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			store, err := workflowStore()
-			if err != nil {
-				return err
-			}
-			ws := store.List()
-			if len(ws) == 0 {
-				fmt.Println("no workflows yet — add one with: ghostline workflow add --name x --command '...'")
-				return nil
-			}
-			for _, w := range ws {
-				if w.Description != "" {
-					fmt.Printf("%-16s %s\n%-16s   %s\n", w.Name, w.Description, "", w.Command)
-				} else {
-					fmt.Printf("%-16s %s\n", w.Name, w.Command)
-				}
-			}
-			return nil
-		},
-	}
-}
-
-func workflowRemoveCmd() *cobra.Command {
-	var name string
-	cmd := &cobra.Command{
-		Use:   "remove",
-		Short: "Remove a saved command",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			store, err := workflowStore()
-			if err != nil {
-				return err
-			}
-			removed, err := store.Remove(name)
-			if err != nil {
-				return err
-			}
-			if !removed {
-				return fmt.Errorf("no workflow named %q", name)
-			}
-			fmt.Printf("removed workflow %q\n", name)
-			return nil
-		},
-	}
-	cmd.Flags().StringVar(&name, "name", "", "workflow name")
-	return cmd
-}
-
-func workflowShowCmd() *cobra.Command {
-	var name string
-	var sets []string
-	cmd := &cobra.Command{
-		Use:   "show",
-		Short: "Print a saved command, expanding {{placeholders}} from --set",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			store, err := workflowStore()
-			if err != nil {
-				return err
-			}
-			w, ok := store.Get(name)
-			if !ok {
-				return fmt.Errorf("no workflow named %q", name)
-			}
-			values := map[string]string{}
-			for _, s := range sets {
-				if k, v, found := strings.Cut(s, "="); found {
-					values[k] = v
-				}
-			}
-			fmt.Println(workflow.Expand(w.Command, values))
-			return nil
-		},
-	}
-	cmd.Flags().StringVar(&name, "name", "", "workflow name")
-	cmd.Flags().StringArrayVar(&sets, "set", nil, "placeholder value, key=value (repeatable)")
-	return cmd
 }
 
 func recoverCmd() *cobra.Command {

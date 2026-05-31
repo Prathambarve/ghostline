@@ -21,15 +21,15 @@ type Config struct {
 	// ManagedURL is the ghostline proxy endpoint. When set and no direct API key
 	// is configured for the selected backend, requests are routed here instead.
 	// Your key lives on the proxy server — users never see it.
-	ManagedURL          string `yaml:"managed_url"`
-	SetupComplete       bool   `yaml:"setup_complete"`
-	HistoryEnabled      bool   `yaml:"history_enabled"`
-	SendCWD             bool   `yaml:"send_cwd"`
-	SendGitRemote       bool   `yaml:"send_git_remote"`
-	SendGitStatus       bool   `yaml:"send_git_status"`
-	SendDirFiles        bool   `yaml:"send_dir_files"`
-	SendRecentCommands  bool   `yaml:"send_recent_commands"`
-	SendStderr          bool   `yaml:"send_stderr"`
+	ManagedURL         string `yaml:"managed_url"`
+	SetupComplete      bool   `yaml:"setup_complete"`
+	HistoryEnabled     bool   `yaml:"history_enabled"`
+	SendCWD            bool   `yaml:"send_cwd"`
+	SendGitRemote      bool   `yaml:"send_git_remote"`
+	SendGitStatus      bool   `yaml:"send_git_status"`
+	SendDirFiles       bool   `yaml:"send_dir_files"`
+	SendRecentCommands bool   `yaml:"send_recent_commands"`
+	SendStderr         bool   `yaml:"send_stderr"`
 }
 
 func Default() *Config {
@@ -133,16 +133,6 @@ func FixCachePath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "recoveries.jsonl"), nil
-}
-
-// WorkflowsPath is the YAML file of user-authored saved commands (workflows)
-// surfaced in the command palette.
-func WorkflowsPath() (string, error) {
-	dir, err := Dir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "workflows.yaml"), nil
 }
 
 func filePath() (string, error) {

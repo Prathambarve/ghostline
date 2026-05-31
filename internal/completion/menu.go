@@ -8,14 +8,12 @@ import (
 	"github.com/prathamesh/ghostline/internal/session"
 )
 
-// Candidate is one selectable suggestion. It is the shared shape for both the
-// Fig-style completion menu (Command + Description) and the command palette
-// (which also sets Source: "workflow", "frequent", or "next"). JSON tags let the
-// daemon return these directly on the wire.
+// Candidate is one selectable suggestion in the Fig-style completion menu: a
+// full command line plus a short description. JSON tags let the daemon return
+// these directly on the wire.
 type Candidate struct {
 	Command     string `json:"command"`
 	Description string `json:"description,omitempty"`
-	Source      string `json:"source,omitempty"`
 }
 
 // menuDelimiter separates a command from its description in the model's output.
