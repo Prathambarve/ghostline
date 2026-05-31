@@ -66,6 +66,7 @@ internal/completion/menu.go  — Multi-candidate described completions (Candidat
 internal/completion/         — Completion prompt builder + suffix sanitizer + intent-mode prompt
 internal/recovery/           — Error recovery: deterministic typo corrector + LLM prompt/parser
 internal/envprobe/           — Environment fact gatherer (tool version/path, version-file pins, venv) feeding env-aware recovery; runs client-side in `ghostline recover`
+internal/nextstep/           — Proactive next-step prediction: LLM workflow reasoning + a learned cache (predict once → replay offline) behind the grey ghost-text suggestion
 internal/llm/llm.go          — Backend interface + factory (selects anthropic, openai, or groq)
 internal/anthropic/client.go — HTTP client for the Claude API /v1/messages endpoint
 internal/openai/client.go    — HTTP client for OpenAI-compatible /chat/completions (OpenAI + Groq via NewCompatible)
@@ -84,6 +85,7 @@ The Go binary is the single source of truth and is fully cross-platform (Linux/m
 | Error recovery (pre-fill fix) | ✅ | ✅ |
 | Secret guard at the prompt (Phase 3) | ✅ | ❌ not ported |
 | Completion menu — Fig-style (Phase 4) | ✅ | ❌ not ported |
+| Next-step prediction (grey ghost text) | ✅ | ❌ readline has no `POSTDISPLAY` |
 
 **Why it's not a copy-paste port:** the zsh integration is ZLE-based (`zle -N`, `BUFFER`/`CURSOR`, `zle -M`, the `accept-line` override, `${1:l}`, `print -z`, 1-indexed arrays, the `<->` glob). Bash uses readline instead (`bind -x` with `READLINE_LINE`/`READLINE_POINT`), has no ZLE, no native preexec (DEBUG trap), and 0-indexed arrays. Each feature needs a bash reimplementation. Specifically:
 - **Completion menu** ports cleanly via `bind -x` rewriting `READLINE_LINE`; the `_ghostline_pick` helper is mostly portable (drop the `<->` glob and 1-indexed arrays).
@@ -161,6 +163,17 @@ The recovery moat: diagnose **shell/environment** failures precisely instead of 
 - **Privacy** — gated by `send_env_probe` (Recommended on, strict off). Probe output (paths/versions) is only ever placed in the in-flight prompt; it is **never written to disk**. The daemon also blanks `env_context` when the knob is off (defense in depth).
 - The probe cost is paid before the socket call, so even fixcache/deterministic hits pay it; kept negligible by doing only fast PATH/file reads plus one bounded version exec, degrading gracefully to whatever was gathered on timeout. Recovery is not the latency-critical path (that's `Ctrl+Space`).
 
+### Next-step prediction (`internal/nextstep/` + grey ghost text)
+
+Proactively predicts the **next step in your workflow** — including a command you've never run here (`terraform plan` → `apply`, `git clone X` → `cd X && …`, a failure → its rollback). This is the part only a model can do: frecency/history (`history.Successors`, zsh-autosuggestions, zoxide) can only replay paths already walked; this *reasons forward*. Shown as grey ghost text on an empty prompt, accepted with `Ctrl+Space`.
+
+- **Engine (`internal/nextstep/`)** — `ShouldPredict(cmd, exitCode)` gates to workflow-bearing moments (a curated first-token allowlist: terraform/git/docker/npm/make/kubectl/…) **or any failure**; trivial commands (`ls`/`cd`/`cat`) → nothing. `buildPrompt` feeds the recent-command **trajectory** + cwd/git/project and asks for ONE next command; `parseResult` reads `NEXT:`/`RISK:` (or `NONE`). `isDestructive` flags irreversible steps (apply/destroy/force-push/rm/delete/deploy…) — applied even if the model says "safe."
+- **The moat mechanic** — the LLM makes the semantic leap once; a learned cache (`cache.go`, same dedupe/compaction/secret-gating as `fixcache`, keyed `(cmd, repo)`) replays it **instantly and offline** next time. Frecency can't propose the unseen step; the model can; the cache makes it free on repeat.
+- **Daemon** — `handlePredict`: gate → cache `Lookup` (instant) → on miss call the backend → cache `Learn`. Returns `{prediction, destructive}`. Gated on `predict_enabled`.
+- **CLI** — `ghostline predict --session --cwd --last-cmd --exit-code` prints the predicted command (line 1) and `destructive` (line 2) when flagged.
+- **Shell (`ghostline.zsh`, zsh-only)** — `precmd` stashes `(cmd, exit)` unless recovery just pre-filled the buffer (recovery owns failures it can fix; prediction handles the rest). A `line-init` hook (registered via the conflict-safe `add-zle-hook-widget`) fires an async `ghostline predict` over a process-substitution pipe watched by `zle -F`; when it lands, a grey `POSTDISPLAY` renders it (red + ⚠ for destructive). `Ctrl+Space` on an empty buffer accepts it into `BUFFER` (you still press Enter — never auto-run); a `line-pre-redraw` hook clears the ghost as soon as you type. **Not ported to bash** — readline has no `POSTDISPLAY` (see parity table).
+- **Stays inside the two hard rules**: off the typing hot path (async, post-command — `Ctrl+Space` completion is untouched), and one step at a time with a human keystroke to run it (intent-mode's proactive cousin; no chaining, no auto-run).
+
 ### Intent mode (safe single-step automation)
 
 `completer.go` detects when the buffer is a plain-language *goal* rather than a command prefix and asks the model for **one** runnable command that replaces the buffer (the user still reads it and presses Enter — no chaining, no auto-run).
@@ -193,11 +206,12 @@ send_dir_files: true                    # include nearby file names
 send_recent_commands: true              # include recent commands from this shell session
 send_stderr: true                       # include stderr in recovery prompts
 send_env_probe: true                    # probe tool version/path + project version pins on errors (env-aware recovery)
+predict_enabled: true                   # proactive next-step prediction (grey ghost text after workflow commands)
 ```
 
 The Claude API key is resolved from `anthropic_api_key` if set, otherwise from `ANTHROPIC_API_KEY` in the environment. OpenAI and Groq resolve the same way (`openai_api_key`/`OPENAI_API_KEY`, `groq_api_key`/`GROQ_API_KEY`). Keep keys in env vars; never commit them.
 
-`ghostline setup --reconfigure` reruns the first-run wizard. The Recommended profile keeps Ghostline useful while remaining explicit: no telemetry/analytics collection, per-user config/history under `~/.ghostline/`, and only terminal context needed for completion/recovery sent to the selected backend. The strict profile disables persisted history, recent-command context, stderr, git remote/status, nearby file names, cwd context, and the environment probe.
+`ghostline setup --reconfigure` reruns the first-run wizard. The Recommended profile keeps Ghostline useful while remaining explicit: no telemetry/analytics collection, per-user config/history under `~/.ghostline/`, and only terminal context needed for completion/recovery sent to the selected backend. The strict profile disables persisted history, recent-command context, stderr, git remote/status, nearby file names, cwd context, the environment probe, and next-step prediction.
 
 ### Daemon lifecycle
 

@@ -19,6 +19,7 @@ import (
 	"github.com/prathamesh/ghostline/internal/fixcache"
 	"github.com/prathamesh/ghostline/internal/history"
 	"github.com/prathamesh/ghostline/internal/llm"
+	"github.com/prathamesh/ghostline/internal/nextstep"
 	"github.com/prathamesh/ghostline/internal/recovery"
 	"github.com/prathamesh/ghostline/internal/session"
 )
@@ -28,6 +29,9 @@ const maxHistoryLines = 5000
 
 // maxFixCacheLines bounds the persisted error→fix recovery cache.
 const maxFixCacheLines = 2000
+
+// maxPredictCacheLines bounds the persisted next-step prediction cache.
+const maxPredictCacheLines = 2000
 
 // offerTTL bounds how long a pending recovery offer waits to be accepted. The
 // shell pre-fills the fix into the very next prompt, so acceptance is normally
@@ -71,6 +75,9 @@ type Response struct {
 	Sessions   int                    `json:"sessions,omitempty"`
 	Error      string                 `json:"error,omitempty"`
 	Candidates []completion.Candidate `json:"candidates,omitempty"`
+	// Prediction (next-step) response.
+	Prediction  string `json:"prediction,omitempty"`
+	Destructive bool   `json:"destructive,omitempty"`
 }
 
 // offer is a recovery suggestion awaiting the user's verdict. We hold the key
@@ -96,12 +103,14 @@ type failure struct {
 }
 
 type Server struct {
-	cfg       *config.Config
-	store     *session.Store
-	history   *history.Store
-	fixcache  *fixcache.Store
-	completer *completion.Completer
-	recoverer *recovery.Recovery
+	cfg         *config.Config
+	store       *session.Store
+	history     *history.Store
+	fixcache    *fixcache.Store
+	completer   *completion.Completer
+	recoverer   *recovery.Recovery
+	predictor   *nextstep.Predictor
+	predictache *nextstep.Store
 
 	offersMu sync.Mutex
 	offers   map[string]offer // sessionID → last LLM fix awaiting acceptance
@@ -122,15 +131,23 @@ func NewServer(cfg *config.Config) *Server {
 			fcache = fixcache.NewStore(path, maxFixCacheLines)
 		}
 	}
+	var pcache *nextstep.Store
+	if cfg.PredictEnabled {
+		if path, err := config.PredictCachePath(); err == nil {
+			pcache = nextstep.NewStore(path, maxPredictCacheLines)
+		}
+	}
 	return &Server{
-		cfg:       cfg,
-		store:     session.NewStore(cfg.MaxContextCommands),
-		history:   hist,
-		fixcache:  fcache,
-		completer: completion.New(gen, cfg.CompletionTimeoutMS),
-		recoverer: recovery.New(gen, cfg.RecoveryTimeoutMS),
-		offers:    make(map[string]offer),
-		lastFail:  make(map[string]failure),
+		cfg:         cfg,
+		store:       session.NewStore(cfg.MaxContextCommands),
+		history:     hist,
+		fixcache:    fcache,
+		completer:   completion.New(gen, cfg.CompletionTimeoutMS),
+		recoverer:   recovery.New(gen, cfg.RecoveryTimeoutMS),
+		predictor:   nextstep.New(gen, cfg.RecoveryTimeoutMS),
+		predictache: pcache,
+		offers:      make(map[string]offer),
+		lastFail:    make(map[string]failure),
 	}
 }
 
@@ -190,6 +207,8 @@ func (s *Server) handleConn(conn net.Conn) {
 		resp = s.handleCompleteMenu(req)
 	case "recover":
 		resp = s.handleRecover(req)
+	case "predict":
+		resp = s.handlePredict(req)
 	case "update_context":
 		resp = s.handleUpdateContext(req)
 	case "status":
@@ -332,6 +351,45 @@ func recoveryResponse(fix, why string) Response {
 		display = fix + " — " + why
 	}
 	return Response{Type: "recovery", Fix: fix, Why: why, Suggestion: display}
+}
+
+// handlePredict returns the predicted next workflow step for the just-run
+// command. Gated to workflow moments; replays a cached prediction instantly
+// (offline) and only calls the model on a miss, then caches it.
+func (s *Server) handlePredict(req Request) Response {
+	if !s.cfg.PredictEnabled {
+		return Response{Type: "none"}
+	}
+	lastCmd := strings.TrimSpace(req.Command)
+	if !nextstep.ShouldPredict(lastCmd, req.ExitCode) {
+		return Response{Type: "none"}
+	}
+
+	ctx := *s.store.Get(req.SessionID)
+	if s.cfg.SendCWD && req.CWD != "" && ctx.CWD == "" {
+		ctx.CWD = req.CWD
+	}
+	if !s.cfg.SendRecentCommands {
+		ctx.RecentCommands = nil
+	}
+
+	// Tier 0: replay a cached prediction for this exact (cmd, repo) — instant,
+	// offline. This is the workflow flywheel: the model's leap, learned once.
+	if s.predictache != nil {
+		if e := s.predictache.Lookup(lastCmd, ctx.GitRepo); e != nil {
+			return Response{Type: "prediction", Prediction: e.Next, Destructive: e.Destructive}
+		}
+	}
+
+	res, err := s.predictor.Predict(lastCmd, req.ExitCode, &ctx)
+	if err != nil || res == nil {
+		return Response{Type: "none"}
+	}
+
+	if s.predictache != nil {
+		s.predictache.Learn(lastCmd, ctx.GitRepo, res.Next, res.Destructive) //nolint:errcheck
+	}
+	return Response{Type: "prediction", Prediction: res.Next, Destructive: res.Destructive}
 }
 
 // learnIfAccepted checks whether the just-run command was the fix we offered

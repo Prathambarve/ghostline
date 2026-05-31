@@ -34,6 +34,9 @@ type Config struct {
 	// version-file reads) for the failing tool and send those facts for sharper
 	// environment diagnoses. Off in the strict profile.
 	SendEnvProbe bool `yaml:"send_env_probe"`
+	// PredictEnabled turns on proactive next-step prediction (the grey ghost-text
+	// suggestion after workflow commands). Off in the strict profile.
+	PredictEnabled bool `yaml:"predict_enabled"`
 }
 
 func Default() *Config {
@@ -54,6 +57,7 @@ func Default() *Config {
 		SendRecentCommands:  true,
 		SendStderr:          true,
 		SendEnvProbe:        true,
+		PredictEnabled:      true,
 	}
 }
 
@@ -138,6 +142,16 @@ func FixCachePath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "recoveries.jsonl"), nil
+}
+
+// PredictCachePath is the JSONL file of learned next-step predictions, replayed
+// instantly and offline for a repeated workflow moment.
+func PredictCachePath() (string, error) {
+	dir, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "predictions.jsonl"), nil
 }
 
 func filePath() (string, error) {

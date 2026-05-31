@@ -20,6 +20,17 @@ fi
 # internally), so a direct assignment is all that's needed.
 
 _ghostline_complete() {
+    # On an empty prompt with a pending next-step prediction, Ctrl+Space ACCEPTS
+    # the grey ghost text (fills the buffer — you still press Enter to run it).
+    # Otherwise it falls through to the normal LLM completion of what you've typed.
+    if [[ -z "$BUFFER" && -n "$_GHOSTLINE_PREDICTION" ]]; then
+        BUFFER="$_GHOSTLINE_PREDICTION"
+        CURSOR=${#BUFFER}
+        _ghostline_pred_clear
+        zle redisplay
+        return
+    fi
+
     [[ -z "$BUFFER" ]] && return
 
     local result
@@ -43,6 +54,69 @@ zle -N _ghostline_complete
 bindkey '^@' _ghostline_complete       # Ctrl+Space
 bindkey '^ ' _ghostline_complete       # Ctrl+Space (alternate spelling)
 bindkey '^X^G' _ghostline_complete     # Ctrl+X Ctrl+G — terminal-independent fallback
+
+# ── ZLE: proactive next-step prediction (grey ghost text) ────────────────────
+# After a workflow command, precmd stashes (cmd, exit). When the next prompt's
+# line editor starts, we fire an async `ghostline predict` (process-substitution
+# pipe + `zle -F`, the standard zsh async pattern); when it lands we render the
+# predicted command as grey POSTDISPLAY. Accept with Ctrl+Space (see above).
+# Daemon-side gating decides whether a command warrants a prediction, so trivial
+# commands produce nothing. Destructive steps render in red with a ⚠ marker — you
+# still read and press Enter, so accepting only fills the buffer, never runs it.
+
+_ghostline_pred_clear() {
+    [[ -z "$_GHOSTLINE_PREDICTION" ]] && return
+    _GHOSTLINE_PREDICTION=""
+    _GHOSTLINE_PRED_DESTRUCTIVE=0
+    POSTDISPLAY=""
+    [[ -n "$_GHOSTLINE_PRED_HL" ]] && region_highlight=(${region_highlight:#$_GHOSTLINE_PRED_HL})
+    _GHOSTLINE_PRED_HL=""
+}
+
+# Fires when the async prediction is readable. $1 is the fd.
+_ghostline_pred_ready() {
+    local fd="$1" pred="" risk="" line n=0
+    while IFS= read -r line <&$fd; do
+        (( n++ ))
+        if (( n == 1 )); then pred="$line"; else risk="$line"; fi
+    done
+    zle -F "$fd"            # unregister the handler
+    exec {fd}<&-            # close the fd
+
+    [[ -z "$pred" ]] && return
+    [[ -n "$BUFFER" ]] && return                 # user already started typing
+    [[ -n "$_GHOSTLINE_PREDICTION" ]] && return
+
+    _GHOSTLINE_PREDICTION="$pred"
+    local style="fg=8" marker=""                 # grey by default
+    if [[ "$risk" == destructive ]]; then
+        _GHOSTLINE_PRED_DESTRUCTIVE=1
+        style="fg=red"
+        marker=" ⚠"
+    fi
+    POSTDISPLAY=" ${pred}${marker}"
+    local start=${#BUFFER}
+    _GHOSTLINE_PRED_HL="$start $((start + ${#POSTDISPLAY})) $style"
+    region_highlight+=("$_GHOSTLINE_PRED_HL")
+    zle -R
+}
+
+# Hook: when a fresh prompt opens, fire the prediction stashed by precmd.
+_ghostline_pred_lineinit() {
+    _GHOSTLINE_PREDICTION=""; _GHOSTLINE_PRED_HL=""; _GHOSTLINE_PRED_DESTRUCTIVE=0
+    [[ -z "$_GHOSTLINE_PRED_CMD" ]] && return
+    local cmd="$_GHOSTLINE_PRED_CMD" ec="$_GHOSTLINE_PRED_EC"
+    _GHOSTLINE_PRED_CMD=""
+    [[ -n "$BUFFER" ]] && return                 # recovery pre-filled the buffer — yield to it
+    exec {_GHOSTLINE_PRED_FD}< <(ghostline predict \
+        --session "$GHOSTLINE_SESSION" --last-cmd "$cmd" --exit-code "$ec" --cwd "$PWD" 2>/dev/null)
+    zle -F "$_GHOSTLINE_PRED_FD" _ghostline_pred_ready
+}
+
+# Hook: clear the ghost as soon as the user types (buffer no longer empty).
+_ghostline_pred_clear_on_type() {
+    [[ -n "$_GHOSTLINE_PREDICTION" && -n "$BUFFER" ]] && _ghostline_pred_clear
+}
 
 # ── Picker: chooser for the described completion menu ─────────────────────────
 # Reads TSV (`command<TAB>label`) on stdin, shows the labels, and echoes the
@@ -168,6 +242,7 @@ _ghostline_preexec() {
 _ghostline_precmd() {
     local exit_code=$?
     local last_cmd="$_GHOSTLINE_LAST_CMD"
+    local _did_prefill=0
     _GHOSTLINE_LAST_CMD=""
 
     [[ -z "$last_cmd" ]] && return
@@ -243,8 +318,18 @@ _ghostline_precmd() {
                 # Pre-fill the corrected command into the next prompt's buffer so
                 # the user can run it by just pressing Enter (or edit/clear it).
                 print -z -- "$fix"
+                _did_prefill=1
             fi
         fi
+    fi
+
+    # ── Next-step prediction: stash for the upcoming prompt ──────────────────
+    # Unless recovery just pre-filled the buffer (it owns the next prompt). The
+    # zle-line-init hook fires the async prediction; daemon-side gating decides
+    # whether this command actually warrants one (trivial commands → nothing).
+    if (( ! _did_prefill )); then
+        _GHOSTLINE_PRED_CMD="$last_cmd"
+        _GHOSTLINE_PRED_EC="$exit_code"
     fi
 }
 
@@ -280,6 +365,17 @@ if [[ -z "$_GHOSTLINE_SETUP_DONE" ]]; then
 
     typeset -g _GHOSTLINE_LAST_CMD=""
     typeset -g _GHOSTLINE_STDERR_OFFSET=0
+    typeset -g _GHOSTLINE_PREDICTION="" _GHOSTLINE_PRED_CMD="" _GHOSTLINE_PRED_HL=""
+
+    # Register the next-step prediction hooks via the conflict-safe hook API, so
+    # we coexist with zsh-syntax-highlighting / zsh-autosuggestions instead of
+    # clobbering their line-init / line-pre-redraw widgets. Registered once per
+    # shell (function bodies above are still refreshed on every source).
+    autoload -Uz add-zle-hook-widget 2>/dev/null
+    if (( $+functions[add-zle-hook-widget] )); then
+        add-zle-hook-widget line-init _ghostline_pred_lineinit 2>/dev/null
+        add-zle-hook-widget line-pre-redraw _ghostline_pred_clear_on_type 2>/dev/null
+    fi
 
     # Auto-start daemon
     {

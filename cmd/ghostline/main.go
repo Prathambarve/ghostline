@@ -30,6 +30,7 @@ func main() {
 		completeCmd(),
 		completeMenuCmd(),
 		recoverCmd(),
+		predictCmd(),
 		contextCmd(),
 		statusCmd(),
 		setupCmd(),
@@ -219,6 +220,48 @@ func recoverCmd() *cobra.Command {
 	cmd.Flags().StringVar(&stderr, "stderr", "", "stderr output from failed command")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "working directory of the failed command")
 	cmd.Flags().IntVar(&exitCode, "exit-code", 1, "exit code of failed command")
+	return cmd
+}
+
+func predictCmd() *cobra.Command {
+	var lastCmd, sessionID, cwd string
+	var exitCode int
+	cmd := &cobra.Command{
+		Use:   "predict",
+		Short: "Predict the next workflow step after a command",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if lastCmd == "" {
+				return nil
+			}
+			if cfg, err := config.Load(); err != nil || !cfg.PredictEnabled {
+				return nil
+			}
+			if err := daemon.EnsureDaemon(); err != nil {
+				return nil
+			}
+			resp, err := daemon.SendRequest(daemon.Request{
+				Type:      "predict",
+				SessionID: sessionID,
+				Command:   lastCmd,
+				ExitCode:  exitCode,
+				CWD:       cwd,
+			})
+			if err != nil || resp == nil || resp.Type != "prediction" || resp.Prediction == "" {
+				return nil
+			}
+			// Line 1 = the predicted command (the shell renders this as ghost text).
+			// Line 2 = "destructive" when the step is irreversible / hard to undo.
+			fmt.Print(resp.Prediction)
+			if resp.Destructive {
+				fmt.Print("\ndestructive")
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&lastCmd, "last-cmd", "", "the command that just ran")
+	cmd.Flags().StringVar(&sessionID, "session", "", "shell session ID")
+	cmd.Flags().StringVar(&cwd, "cwd", "", "current working directory")
+	cmd.Flags().IntVar(&exitCode, "exit-code", 0, "exit code of the last command")
 	return cmd
 }
 
@@ -448,6 +491,7 @@ func applyRecommendedPrivacy(cfg *config.Config) {
 	cfg.SendRecentCommands = true
 	cfg.SendStderr = true
 	cfg.SendEnvProbe = true
+	cfg.PredictEnabled = true
 }
 
 func applyStrictPrivacy(cfg *config.Config) {
@@ -459,6 +503,7 @@ func applyStrictPrivacy(cfg *config.Config) {
 	cfg.SendRecentCommands = false
 	cfg.SendStderr = false
 	cfg.SendEnvProbe = false
+	cfg.PredictEnabled = false
 }
 
 func applyCustomPrivacy(reader *bufio.Reader, cfg *config.Config) {
@@ -472,6 +517,7 @@ func applyCustomPrivacy(reader *bufio.Reader, cfg *config.Config) {
 	cfg.SendRecentCommands = promptYesNo(reader, "Send recent commands from this shell session? (Recommended: yes)", true)
 	cfg.SendStderr = promptYesNo(reader, "Send stderr from failed commands for recovery? (Recommended: yes)", true)
 	cfg.SendEnvProbe = promptYesNo(reader, "Probe local tool versions/paths on errors for sharper recovery? (Recommended: yes)", true)
+	cfg.PredictEnabled = promptYesNo(reader, "Predict the next workflow step as a grey suggestion? (Recommended: yes)", true)
 }
 
 func promptYesNo(reader *bufio.Reader, question string, recommended bool) bool {
@@ -508,6 +554,7 @@ func printPrivacySummary(cfg *config.Config) {
 		enabledText(cfg.SendStderr),
 		enabledText(cfg.SendEnvProbe),
 	)
+	fmt.Printf("next-step prediction: %s\n", enabledText(cfg.PredictEnabled))
 }
 
 func enabledText(v bool) string {
