@@ -55,6 +55,10 @@ bindkey '^@' _ghostline_complete       # Ctrl+Space
 bindkey '^ ' _ghostline_complete       # Ctrl+Space (alternate spelling)
 bindkey '^X^G' _ghostline_complete     # Ctrl+X Ctrl+G — terminal-independent fallback
 
+# Debug log (only when GHOSTLINE_DEBUG is set) — used to diagnose the prediction
+# render path, which has no headless test.
+_ghostline_log() { [[ -n "$GHOSTLINE_DEBUG" ]] && print -r -- "$(date +%T.%N 2>/dev/null || date +%T) $*" >> "${GHOSTLINE_DEBUG_LOG:-/tmp/ghostline-debug.log}" 2>/dev/null; }
+
 # ── ZLE: proactive next-step prediction (grey ghost text) ────────────────────
 # After a workflow command, precmd stashes (cmd, exit). When the next prompt's
 # line editor starts, we fire an async `ghostline predict` (process-substitution
@@ -73,7 +77,10 @@ _ghostline_pred_clear() {
     _GHOSTLINE_PRED_HL=""
 }
 
-# Fires when the async prediction is readable. $1 is the fd.
+# Fires when the async prediction is readable. $1 is the fd. This is a `zle -F`
+# fd handler, which is NOT run as a widget — so BUFFER/POSTDISPLAY here are plain
+# variables, not the live editor. We therefore read the result, then invoke the
+# real widget `_ghostline_pred_render` via `zle` to actually paint it.
 _ghostline_pred_ready() {
     local fd="$1" pred="" risk="" line n=0
     while IFS= read -r line <&$fd; do
@@ -82,7 +89,19 @@ _ghostline_pred_ready() {
     done
     zle -F "$fd"            # unregister the handler
     exec {fd}<&-            # close the fd
+    _ghostline_log "ready: pred='$pred' risk='$risk'"
 
+    [[ -z "$pred" ]] && return
+    _GHOSTLINE_PRED_PENDING="${pred}"$'\n'"${risk}"
+    zle _ghostline_pred_render          # run the widget (proper editor context)
+}
+
+# Widget: paints the pending prediction as grey ghost text. Runs in real widget
+# context, so POSTDISPLAY / region_highlight affect the live line editor.
+_ghostline_pred_render() {
+    [[ -z "$_GHOSTLINE_PRED_PENDING" ]] && return
+    local pred="${_GHOSTLINE_PRED_PENDING%%$'\n'*}" risk="${_GHOSTLINE_PRED_PENDING#*$'\n'}"
+    _GHOSTLINE_PRED_PENDING=""
     [[ -z "$pred" ]] && return
     [[ -n "$BUFFER" ]] && return                 # user already started typing
     [[ -n "$_GHOSTLINE_PREDICTION" ]] && return
@@ -98,18 +117,22 @@ _ghostline_pred_ready() {
     local start=${#BUFFER}
     _GHOSTLINE_PRED_HL="$start $((start + ${#POSTDISPLAY})) $style"
     region_highlight+=("$_GHOSTLINE_PRED_HL")
+    _ghostline_log "rendered POSTDISPLAY='$POSTDISPLAY' hl='$_GHOSTLINE_PRED_HL'"
     zle -R
 }
+zle -N _ghostline_pred_render
 
 # Hook: when a fresh prompt opens, fire the prediction stashed by precmd.
 _ghostline_pred_lineinit() {
     _GHOSTLINE_PREDICTION=""; _GHOSTLINE_PRED_HL=""; _GHOSTLINE_PRED_DESTRUCTIVE=0
+    _ghostline_log "line-init: pred_cmd='$_GHOSTLINE_PRED_CMD' buffer='$BUFFER'"
     [[ -z "$_GHOSTLINE_PRED_CMD" ]] && return
     local cmd="$_GHOSTLINE_PRED_CMD" ec="$_GHOSTLINE_PRED_EC"
     _GHOSTLINE_PRED_CMD=""
     [[ -n "$BUFFER" ]] && return                 # recovery pre-filled the buffer — yield to it
     exec {_GHOSTLINE_PRED_FD}< <(ghostline predict \
         --session "$GHOSTLINE_SESSION" --last-cmd "$cmd" --exit-code "$ec" --cwd "$PWD" 2>/dev/null)
+    _ghostline_log "line-init: fired predict fd=$_GHOSTLINE_PRED_FD"
     zle -F "$_GHOSTLINE_PRED_FD" _ghostline_pred_ready
 }
 
@@ -330,6 +353,7 @@ _ghostline_precmd() {
     if (( ! _did_prefill )); then
         _GHOSTLINE_PRED_CMD="$last_cmd"
         _GHOSTLINE_PRED_EC="$exit_code"
+        _ghostline_log "precmd: stashed cmd='$last_cmd' ec=$exit_code"
     fi
 }
 

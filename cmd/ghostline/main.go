@@ -251,9 +251,11 @@ func predictCmd() *cobra.Command {
 			}
 			// Line 1 = the predicted command (the shell renders this as ghost text).
 			// Line 2 = "destructive" when the step is irreversible / hard to undo.
-			fmt.Print(resp.Prediction)
+			// Trailing newlines are required: the zsh integration reads this over a
+			// pipe with `while read`, which drops a final unterminated line.
+			fmt.Println(resp.Prediction)
 			if resp.Destructive {
-				fmt.Print("\ndestructive")
+				fmt.Println("destructive")
 			}
 			return nil
 		},
