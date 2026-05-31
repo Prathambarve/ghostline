@@ -33,6 +33,22 @@ _ghostline_complete() {
 bind -x '"\C- ": _ghostline_complete'    # Ctrl+Space
 bind -x '"\C-x\C-g": _ghostline_complete' # Ctrl+X Ctrl+G — universal fallback
 
+# ── Pre-fill the next prompt (bash equivalent of zsh's `print -z`) ─────────────
+# Bash has no API to seed the next readline buffer, so we use the classic trick:
+# bind the terminal's reply to a Device Status Report (ESC[5n → ESC[0n) to a
+# readline macro that types the text, then emit the query. When the terminal
+# answers, readline runs the macro and the text appears in the prompt — the user
+# just presses Enter (or edits it). Macro text is typed literally (no shell
+# expansion), so there's no injection risk; we only escape it for readline.
+_ghostline_prefill() {
+    local text="$1"
+    [[ -z "$text" ]] && return
+    text="${text//\\/\\\\}"   # escape backslashes for the readline macro
+    text="${text//\"/\\\"}"   # escape double-quotes
+    bind '"\e[0n": "'"$text"'"' 2>/dev/null
+    printf '\e[5n'
+}
+
 # ── preexec via DEBUG trap ────────────────────────────────────────────────────
 # Bash has no native preexec hook. We use a DEBUG trap + a flag set at the END
 # of PROMPT_COMMAND so the trap only captures the very next user command, not
@@ -123,9 +139,12 @@ _ghostline_precmd() {
                     printf '%s\n' "$fix"
                 fi
 
-                # In bash there's no print -z to pre-fill the prompt buffer.
-                # Add the fix to history so the user can press Up to accept it.
+                # Pre-fill the corrected command into the next prompt so the user
+                # just presses Enter (zsh does this with print -z). Also stash it
+                # in history as a fallback (Up arrow) for terminals where the
+                # readline DSR trick doesn't land.
                 history -s "$fix"
+                _ghostline_prefill "$fix"
             fi
         fi
     fi
